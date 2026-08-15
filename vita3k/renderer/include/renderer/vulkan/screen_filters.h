@@ -19,6 +19,9 @@
 
 #include <vkutil/objects.h>
 
+#include <cstddef>
+#include <cstdint>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -26,6 +29,17 @@ namespace renderer::vulkan {
 
 class ScreenRenderer;
 struct Viewport;
+
+// One member of a shader's `layout(push_constant) uniform PC {...}` block,
+// as reflected straight from the compiled SPIR-V -- name/offset/size come
+// from the shader itself, not a hand-maintained C++ struct, so this stays
+// correct automatically as PC blocks grow, shrink, or get reordered.
+struct PushConstantFieldInfo {
+    std::string name;
+    uint32_t offset;
+    uint32_t size;
+    bool is_int; // true for int/uint members, false for float
+};
 
 class ScreenFilter {
 protected:
@@ -60,8 +74,26 @@ private:
 
     vk::Sampler sampler;
 
+    // reflected from the compiled fragment shader's push_constant block (if
+    // any) during create_layout_sync() -- see reflect_push_constants()
+    std::vector<PushConstantFieldInfo> pc_fields;
+    uint32_t pc_total_size = 0;
+
     void create_layout_sync();
     void create_graphics_pipeline();
+
+    // parses the compiled .frag.spv at fragment_shader_path via SPIRV-Cross
+    // reflection and populates pc_fields / pc_total_size. A shader with no
+    // push_constant block at all leaves both empty/0, which is valid --
+    // create_layout_sync() then skips the push constant range entirely.
+    void reflect_push_constants(std::string_view fragment_shader_path);
+
+    // builds the push constant buffer to upload: zero-filled to pc_total_size
+    // (so any field the shader declares that isn't recognized below stays a
+    // safe, defined 0 instead of whatever was previously in that GPU memory),
+    // then any field name that matches a known semantic value is written at
+    // its reflected offset. Same for every filter -- no per-filter override.
+    void fill_push_constant(std::vector<std::byte> &out, const Viewport &viewport) const;
 
 protected:
     // file name inside shaders-builtin/vulkan
