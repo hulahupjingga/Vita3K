@@ -25,7 +25,7 @@
 // (check for existing use elsewhere, e.g. around GXP->SPIR-V shader
 // translation), it needs to be added as a dependency. Adjust this include
 // path to match wherever it's vendored/found in this build.
-#include <spirv_cross/spirv_cross.hpp>
+#include <spirv_glsl.hpp>
 
 #include <cstddef>
 #include <cstdint>
