@@ -14,11 +14,11 @@ cp -r vita3k/shaders-builtin android/app/assets/shaders-builtin
 
 chmod +x android/gradlew
 
-if [[ -e "${SIGNING_STORE_PATH:-}" ]]; then
-    BUILD_TYPE="Release"
-else
-    BUILD_TYPE="Reldebug"
-fi
+# Force Release build type regardless of keystore presence.
+# build.gradle's release signingConfig automatically falls back to
+# signingConfigs.debug when SIGNING_* secrets/env vars aren't set,
+# so this still produces a valid signed apk without a real keystore.
+BUILD_TYPE="Release"
 
 pushd android > /dev/null
 ./gradlew --stacktrace ":app:assemble${BUILD_TYPE}"
