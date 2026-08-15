@@ -20,6 +20,20 @@
 
 #include "renderer/vulkan/state.h"
 
+// NOTE: reflect_push_constants() below needs SPIRV-Cross for shader
+// reflection. If this project doesn't already link spirv-cross-core
+// (check for existing use elsewhere, e.g. around GXP->SPIR-V shader
+// translation), it needs to be added as a dependency. Adjust this include
+// path to match wherever it's vendored/found in this build.
+#include <spirv_cross/spirv_cross.hpp>
+
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <unordered_map>
+#include <vector>
+
 namespace renderer::vulkan {
 
 ScreenFilter::ScreenFilter(ScreenRenderer &screen_renderer)
@@ -37,6 +51,87 @@ using screen_vertices_t = screen_vertex[screen_vertex_count];
 
 SinglePassScreenFilter::SinglePassScreenFilter(ScreenRenderer &screen)
     : ScreenFilter(screen) {}
+
+void SinglePassScreenFilter::reflect_push_constants(std::string_view fragment_shader_path) {
+    pc_fields.clear();
+    pc_total_size = 0;
+
+    std::ifstream file(std::string(fragment_shader_path), std::ios::binary | std::ios::ate);
+    if (!file) {
+        LOG_ERROR("screen_filters: could not open {} for push-constant reflection", fragment_shader_path);
+        return;
+    }
+    const std::streamsize byte_size = file.tellg();
+    file.seekg(0);
+    std::vector<uint32_t> spirv_words(static_cast<size_t>(byte_size) / sizeof(uint32_t));
+    if (!file.read(reinterpret_cast<char *>(spirv_words.data()), byte_size)) {
+        LOG_ERROR("screen_filters: failed to read {} for push-constant reflection", fragment_shader_path);
+        return;
+    }
+
+    spirv_cross::Compiler compiler(std::move(spirv_words));
+    const auto resources = compiler.get_shader_resources();
+    if (resources.push_constant_buffers.empty())
+        return; // this shader declares no push_constant block -- valid, e.g. Nearest/Bilinear
+
+    const auto &pc_resource = resources.push_constant_buffers[0];
+    const auto &pc_type = compiler.get_type(pc_resource.base_type_id);
+    pc_total_size = static_cast<uint32_t>(compiler.get_declared_struct_size(pc_type));
+
+    for (uint32_t i = 0; i < pc_type.member_types.size(); i++) {
+        PushConstantFieldInfo field{
+            .name = compiler.get_member_name(pc_resource.base_type_id, i),
+            .offset = compiler.type_struct_member_offset(pc_type, i),
+            .size = static_cast<uint32_t>(compiler.get_declared_struct_member_size(pc_type, i)),
+        };
+        const auto &member_type = compiler.get_type(pc_type.member_types[i]);
+        field.is_int = (member_type.basetype == spirv_cross::SPIRType::Int || member_type.basetype == spirv_cross::SPIRType::UInt);
+
+        if (field.name.empty()) {
+            // debug names get stripped in some release/optimized shader builds --
+            // without a name we can't match this field below, so it's left at its
+            // safe zero-filled default rather than guessed at by position.
+            LOG_WARN("screen_filters: push-constant member {} in {} has no debug name (shader stripped?) -- will be left zeroed", i, fragment_shader_path);
+        }
+        pc_fields.push_back(std::move(field));
+    }
+}
+
+void SinglePassScreenFilter::fill_push_constant(std::vector<std::byte> &out, const Viewport &viewport) const {
+    out.assign(pc_total_size, std::byte{ 0 });
+    if (pc_total_size == 0)
+        return;
+
+    struct KnownValue {
+        bool is_int;
+        float f;
+        int32_t i;
+    };
+    // semantic values every filter's shader might ask for by name -- add new
+    // entries here as new shared field names show up; anything reflected
+    // that isn't listed here just stays zeroed rather than guessed at.
+    const std::unordered_map<std::string, KnownValue> known = {
+        { "invSrcW", { false, 1.f / viewport.texture_width, 0 } },
+        { "invSrcH", { false, 1.f / viewport.texture_height, 0 } },
+        { "srcW", { false, static_cast<float>(viewport.texture_width), 0 } },
+        { "srcH", { false, static_cast<float>(viewport.texture_height), 0 } },
+        { "useTexAlpha", { true, 0.f, 0 } },
+        { "effectId", { true, 0.f, 0 } },
+        { "sharpness", { false, 0.5f, 0 } },
+        // ndcX0/ndcY0/ndcX1/ndcY1, resW: not currently meaningful in any
+        // shader that declares them -- left zeroed
+    };
+
+    for (const auto &field : pc_fields) {
+        const auto it = known.find(field.name);
+        if (it == known.end() || field.size != 4)
+            continue; // unrecognized name, or an unexpected size we don't handle -- leave zeroed
+        if (field.is_int)
+            std::memcpy(out.data() + field.offset, &it->second.i, sizeof(int32_t));
+        else
+            std::memcpy(out.data() + field.offset, &it->second.f, sizeof(float));
+    }
+}
 
 SinglePassScreenFilter::~SinglePassScreenFilter() {
     vk::Device device = screen.state.device;
@@ -82,15 +177,22 @@ void SinglePassScreenFilter::create_layout_sync() {
     descr_set_info.setSetLayouts(descr_set_layouts);
     descriptor_sets = device.allocateDescriptorSets(descr_set_info);
 
+    // reflect the compiled fragment shader's push_constant block (if any) so
+    // the pipeline layout's range always matches what the shader actually
+    // declares -- 0, 8, 48 bytes, whatever -- with no per-filter code needed
+    const fs::path builtin_shaders_path = screen.state.static_assets / "shaders-builtin/vulkan";
+    const auto fragment_shader_path = builtin_shaders_path / get_fragment_name();
+    reflect_push_constants(fragment_shader_path.string());
+
     vk::PipelineLayoutCreateInfo layout_info{};
     layout_info.setSetLayouts(descriptor_set_layout);
-    // add push constant for fxaa pipeline, not used by the normal pipeline
     vk::PushConstantRange push_constant{
         .stageFlags = vk::ShaderStageFlagBits::eFragment,
         .offset = 0,
-        .size = 2 * sizeof(float),
+        .size = pc_total_size,
     };
-    layout_info.setPushConstantRanges(push_constant);
+    if (pc_total_size > 0)
+        layout_info.setPushConstantRanges(push_constant);
     pipeline_layout = device.createPipelineLayout(layout_info);
 
     // create vao
@@ -308,8 +410,10 @@ void SinglePassScreenFilter::render(bool is_pre_renderpass, vk::ImageView src_im
         screen.current_cmd_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
         screen.current_cmd_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout, 0, descriptor_sets[screen.swapchain_image_idx], {});
 
-        std::array<float, 2> inv_size = { 1.f / viewport.texture_width, 1.f / viewport.texture_height };
-        screen.current_cmd_buffer.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, 2 * sizeof(float), inv_size.data());
+        std::vector<std::byte> pc_data;
+        fill_push_constant(pc_data, viewport);
+        if (!pc_data.empty())
+            screen.current_cmd_buffer.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, static_cast<uint32_t>(pc_data.size()), pc_data.data());
 
         screen.current_cmd_buffer.draw(4, 1, 0, 0);
     }
@@ -366,6 +470,10 @@ vk::Sampler FXAAScreenFilter::create_sampler() {
     };
     return screen.state.device.createSampler(sampler_info);
 }
+// push constants for FXAA (and Bicubic, and any future filter) are now
+// handled entirely by SinglePassScreenFilter's reflect_push_constants() /
+// fill_push_constant() -- see screen_filters.cpp's base-class definitions.
+// No per-filter struct or override needed here.
 
 struct EasuConstant {
     Viewport viewport;
