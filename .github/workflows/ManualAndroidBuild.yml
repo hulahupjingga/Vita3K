@@ -1,0 +1,88 @@
+name: Build CI
+
+on:
+  workflow_dispatch:
+
+env:
+  BUILD_CONFIG: Release
+
+jobs:
+  android-build:
+    name: Android
+    runs-on: ubuntu-latest
+    env:
+      VCPKG_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-binary-cache
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE }}
+          key: vcpkg-bincache-android-${{ hashFiles('vcpkg.json', 'CMakeLists.txt', 'cmake/**', '.ci/**', 'android/app/build.gradle') }}
+          restore-keys: |
+            vcpkg-bincache-android-
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          add-job-summary: on-failure
+          cache-provider: basic
+          validate-wrappers: false
+
+      - name: Set up Android SDK tools
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Android build environment
+        env:
+          VCPKG_ROOT: /usr/local/share/vcpkg
+        run: |
+          mkdir -p "$VCPKG_BINARY_CACHE"
+          bash ./.ci/setup-android.sh
+
+      - uses: hendrikmuhs/ccache-action@v1.2.23
+
+      - name: Decode Android keystore
+        env:
+          KEYSTORE_ENCODED: ${{ secrets.KEYSTORE }}
+        run: |
+          if [ -n "$KEYSTORE_ENCODED" ]; then
+            echo "$KEYSTORE_ENCODED" | base64 --decode > /home/runner/keystore.jks
+          fi
+
+      - name: Compute artifact paths
+        shell: bash
+        run: |
+          echo "GIT_SHORT_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=vita3k-$(git rev-parse --short HEAD)-android" >> "$GITHUB_ENV"
+          echo "ARTIFACT_DIR=artifacts/vita3k-$(git rev-parse --short HEAD)-android" >> "$GITHUB_ENV"
+
+      - name: Build Android target
+        env:
+          SIGNING_STORE_PATH: /home/runner/keystore.jks
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          VCPKG_ROOT: /usr/local/share/vcpkg
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: bash ./.ci/build-android.sh "${{ env.ARTIFACT_DIR }}"
+
+      - name: Print Android ccache statistics
+        run: ccache -s
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_DIR }}/*.apk
+          if-no-files-found: error
