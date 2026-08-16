@@ -1,0 +1,17 @@
+name: "File Changes Summary"
+
+on:
+  push:
+
+jobs:
+  show-changes:
+    name: Show Changed Files
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: List files changed in this push
+        run: |
+          echo "### Files changed in this push:"
+          # Use jq to extract all added, removed, and modified files from the push payload
+          # and print them as a sorted, unique list.
+          jq -r '.commits[] | (.added[], .removed[], .modified[])' "$GITHUB_EVENT_PATH" | sort -u
