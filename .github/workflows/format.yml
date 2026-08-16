@@ -1,18 +1,13 @@
 name: Format Check
 
 on:
-  push:
+  workflow_dispatch::
     paths:
       - .clang-format
       - vita3k/**
       - tools/**
 
-  pull_request:
-    paths:
-      - .clang-format
-      - vita3k/**
-      - tools/**
-
+  
 jobs:
   format-check:
     name: Format Check (${{ matrix.path }})
