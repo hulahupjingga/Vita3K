@@ -19,18 +19,18 @@
 #include "renderer/vulkan/screen_renderer.h"
 
 #include "renderer/vulkan/state.h"
+#include "util/fs.h"
 
 // NOTE: reflect_push_constants() below needs SPIRV-Cross for shader
 // reflection. If this project doesn't already link spirv-cross-core
 // (check for existing use elsewhere, e.g. around GXP->SPIR-V shader
 // translation), it needs to be added as a dependency. Adjust this include
 // path to match wherever it's vendored/found in this build.
-#include <spirv_glsl.hpp>
+#include <spirv_cross.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <fstream>
 #include <unordered_map>
 #include <vector>
 
@@ -52,24 +52,39 @@ using screen_vertices_t = screen_vertex[screen_vertex_count];
 SinglePassScreenFilter::SinglePassScreenFilter(ScreenRenderer &screen)
     : ScreenFilter(screen) {}
 
-void SinglePassScreenFilter::reflect_push_constants(std::string_view fragment_shader_path) {
+void SinglePassScreenFilter::load_and_reflect_fragment_shader() {
+    const fs::path builtin_shaders_path = screen.state.static_assets / "shaders-builtin/vulkan";
+    const auto fragment_shader_path = builtin_shaders_path / get_fragment_name();
+
+    // fs_utils::read_data is the same mechanism vkutil::load_shader(path)
+    // itself uses internally -- reading it here ourselves (instead of a
+    // plain std::ifstream) means this works on every platform load_shader
+    // already works on, including ones where shaders aren't plain files on
+    // a normal filesystem (e.g. packaged app assets).
+    std::vector<uint8_t> shader_code;
+    if (!fs_utils::read_data(fragment_shader_path, shader_code)) {
+        LOG_ERROR("screen_filters: failed to read fragment shader {}", fragment_shader_path.string());
+        return;
+    }
+
+    // reflect from these exact bytes before creating the shader module, so
+    // reflection and the module can never end up describing two different
+    // compiles of the shader
+    reflect_push_constants(shader_code.data(), shader_code.size());
+
+    fragment_shader = vkutil::load_shader(screen.state.device, shader_code.data(), static_cast<uint32_t>(shader_code.size()));
+}
+
+void SinglePassScreenFilter::reflect_push_constants(const void *data, size_t size) {
     pc_fields.clear();
     pc_total_size = 0;
 
-    std::ifstream file(std::string(fragment_shader_path), std::ios::binary | std::ios::ate);
-    if (!file) {
-        LOG_ERROR("screen_filters: could not open {} for push-constant reflection", fragment_shader_path);
-        return;
-    }
-    const std::streamsize byte_size = file.tellg();
-    file.seekg(0);
-    std::vector<uint32_t> spirv_words(static_cast<size_t>(byte_size) / sizeof(uint32_t));
-    if (!file.read(reinterpret_cast<char *>(spirv_words.data()), byte_size)) {
-        LOG_ERROR("screen_filters: failed to read {} for push-constant reflection", fragment_shader_path);
+    if (size % sizeof(uint32_t) != 0) {
+        LOG_ERROR("screen_filters: fragment shader SPIR-V size ({} bytes) isn't word-aligned, skipping push-constant reflection", size);
         return;
     }
 
-    spirv_cross::Compiler compiler(std::move(spirv_words));
+    spirv_cross::Compiler compiler(static_cast<const uint32_t *>(data), size / sizeof(uint32_t));
     const auto resources = compiler.get_shader_resources();
     if (resources.push_constant_buffers.empty())
         return; // this shader declares no push_constant block -- valid, e.g. Nearest/Bilinear
@@ -91,7 +106,7 @@ void SinglePassScreenFilter::reflect_push_constants(std::string_view fragment_sh
             // debug names get stripped in some release/optimized shader builds --
             // without a name we can't match this field below, so it's left at its
             // safe zero-filled default rather than guessed at by position.
-            LOG_WARN("screen_filters: push-constant member {} in {} has no debug name (shader stripped?) -- will be left zeroed", i, fragment_shader_path);
+            LOG_WARN("screen_filters: push-constant member {} has no debug name (shader stripped?) -- will be left zeroed", i);
         }
         pc_fields.push_back(std::move(field));
     }
@@ -177,12 +192,13 @@ void SinglePassScreenFilter::create_layout_sync() {
     descr_set_info.setSetLayouts(descr_set_layouts);
     descriptor_sets = device.allocateDescriptorSets(descr_set_info);
 
-    // reflect the compiled fragment shader's push_constant block (if any) so
-    // the pipeline layout's range always matches what the shader actually
-    // declares -- 0, 8, 48 bytes, whatever -- with no per-filter code needed
-    const fs::path builtin_shaders_path = screen.state.static_assets / "shaders-builtin/vulkan";
-    const auto fragment_shader_path = builtin_shaders_path / get_fragment_name();
-    reflect_push_constants(fragment_shader_path.string());
+    // read the fragment shader's bytes ONCE via the same mechanism
+    // vkutil::load_shader itself uses (fs_utils::read_data) -- reflection and
+    // the actual shader module are then built from identical bytes, so they
+    // can never disagree about the push_constant block. This also creates
+    // `fragment_shader` early; create_graphics_pipeline() reuses it instead
+    // of loading it a second time.
+    load_and_reflect_fragment_shader();
 
     vk::PipelineLayoutCreateInfo layout_info{};
     layout_info.setSetLayouts(descriptor_set_layout);
@@ -205,14 +221,13 @@ void SinglePassScreenFilter::create_layout_sync() {
 }
 
 void SinglePassScreenFilter::create_graphics_pipeline() {
-    // create shader modules
+    // create vertex shader module -- fragment_shader was already loaded (and
+    // reflected) in create_layout_sync() via load_and_reflect_fragment_shader()
 
     fs::path builtin_shaders_path = screen.state.static_assets / "shaders-builtin/vulkan";
     const auto vertex_shader_path = builtin_shaders_path / get_vertex_name();
-    const auto fragment_shader_path = builtin_shaders_path / get_fragment_name();
 
     vertex_shader = vkutil::load_shader(screen.state.device, vertex_shader_path);
-    fragment_shader = vkutil::load_shader(screen.state.device, fragment_shader_path);
     vk::PipelineShaderStageCreateInfo vert_info{
         .stage = vk::ShaderStageFlagBits::eVertex,
         .module = vertex_shader,
