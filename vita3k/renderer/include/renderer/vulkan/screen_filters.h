@@ -82,11 +82,17 @@ private:
     void create_layout_sync();
     void create_graphics_pipeline();
 
-    // parses the compiled .frag.spv at fragment_shader_path via SPIRV-Cross
-    // reflection and populates pc_fields / pc_total_size. A shader with no
-    // push_constant block at all leaves both empty/0, which is valid --
-    // create_layout_sync() then skips the push constant range entirely.
-    void reflect_push_constants(std::string_view fragment_shader_path);
+    // reads the compiled fragment shader's bytes once (same mechanism
+    // vkutil::load_shader itself uses), reflects its push_constant block
+    // from those bytes, and creates fragment_shader from those same bytes --
+    // so reflection and the shader module can never disagree.
+    void load_and_reflect_fragment_shader();
+
+    // parses SPIR-V bytes already in memory via SPIRV-Cross reflection and
+    // populates pc_fields / pc_total_size. A shader with no push_constant
+    // block at all leaves both empty/0, which is valid -- create_layout_sync()
+    // then skips the push constant range entirely.
+    void reflect_push_constants(const void *data, size_t size);
 
     // builds the push constant buffer to upload: zero-filled to pc_total_size
     // (so any field the shader declares that isn't recognized below stays a
