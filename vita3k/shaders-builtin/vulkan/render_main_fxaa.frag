@@ -15,56 +15,252 @@ layout(push_constant) uniform PC {
     float srcH;
     int   effectId;   // now only used for CRT (2 = on, else off)
     float resW;       // declared but never referenced anywhere below -- dead field, same pattern as in present_mm.frag/present_mmpx.frag
-    float sharpness;  // still used for edge enhancement, but NOT for DLS
+    float sharpness;  // NOT CURRENTLY READ -- see SHARP_DEFAULT in main(); nothing
+                       // writes this via vkCmdPushConstants, so it was unsafe to read
 } pc;
 
 layout(binding = 0) uniform mediump sampler2D texSampler;
 layout(location = 0) in  highp vec2 fragTexCoord;
 layout(location = 0) out vec4 outColor;
 
-float fastLanczos2(float x) {
-    float wA = x - 4.0;
-    float wB = x * wA - wA;
-    wA *= wA;
-    return wB * wA;
+// --- EASU direction/anisotropy, ported from AMD FidelityFX FSR 1.0's
+// FsrEasuSetF (ffx_fsr1.h, master branch -- same file this project vendors
+// at Edengit/externals/FidelityFX-FSR/ffx-fsr/ffx_fsr1.h). This is the
+// single 5-point '+' sample (A=up,B=left,C=center,D=right,E=down) that
+// fsr.txt's FsrMobile also uses -- confirmed identical to the master
+// source, just formatted differently (+(-x) vs -x). Deliberately NOT
+// desktop EASU's 4-corner bilinear-blended direction estimate, since
+// fsr.txt is the Mobile variant and that's what it uses.
+//
+// Sampled fresh at (uv, texel) rather than reused from the gather grid in
+// main() below, so this doesn't depend on that grid's tap-to-pixel
+// ordering at all -- getting that ordering wrong once already caused the
+// diagonal-staircasing bug the `right` gather's FIX comment describes.
+//
+// Uses the r*0.5+g luma proxy from the article fsr.txt is sourced from
+// (atyuwen, "Optimizing AMD FSR for Mobiles", section 5) -- not full RGB
+// luma, but not this file's G-only shortcut either. Costs nothing extra:
+// texture() already returns the full RGB, this just stops discarding .r.
+struct EasuDir { vec2 dir; vec2 len2; float lob; float clp; };
+
+// Estimate the source-texel footprint of one destination pixel.
+// The screen-filter host draws the fullscreen quad over the destination
+// viewport while fragTexCoord spans the source image, so derivatives give us
+// the actual source-pixel footprint without adding a Vita3K-specific uniform.
+//
+// footprint < 1: upscaling (one output pixel sees less than one source texel)
+// footprint ~= 1: native scale
+// footprint > 1: downscaling
+vec2 sourceFootprint() {
+    vec2 dx = abs(dFdx(fragTexCoord)) * vec2(pc.srcW, pc.srcH);
+    vec2 dy = abs(dFdy(fragTexCoord)) * vec2(pc.srcW, pc.srcH);
+
+    // Use the larger derivative rather than dx+dy. For a 2x upscale this
+    // correctly reports ~0.5 source texel per output pixel, instead of 1.0.
+    return max(max(dx, dy), vec2(1.0e-6));
 }
 
-vec2 weightY(float dx, float dy, float c, float std, float spatialFactor) {
-    float x = (dx * dx + dy * dy) * spatialFactor + clamp(abs(c) * std, 0.0, 1.0);
-    float w = fastLanczos2(x);
+float sourceUpscaleFactor(vec2 footprint) {
+    float sx = 1.0 / max(footprint.x, 1.0e-6);
+    float sy = 1.0 / max(footprint.y, 1.0e-6);
+    // Use the geometric mean so a non-uniform scale (e.g. Vita 960x544 to
+    // 1920x1080) is represented by one stable quality factor.
+    return sqrt(max(sx * sy, 1.0));
+}
+
+// Scale-aware EASU kernel width. At large upscales the reconstruction is
+// allowed to use a slightly broader footprint; at 1:1 it falls back to the
+// existing sharpness-controlled kernel. This is intentionally bounded.
+float scaleAwareSpatialFactor(float sharpAmt, vec2 footprint) {
+    float upscale = sourceUpscaleFactor(footprint);
+    float lowResBoost = clamp((upscale - 1.0) * 0.075, 0.0, 0.12);
+    return mix(0.40, 0.65, sharpAmt) * (1.0 - lowResBoost);
+}
+
+// A very small directional pre-resolve for low-resolution upscaling.
+// EASU reconstructs the edge, while this 3-sample tangent resolve reduces
+// the "stair-step" phase changes that remain on diagonals when the source
+// rasterization is substantially below the display resolution.
+//
+// We only return a luminance correction. This avoids washing chroma across
+// colored edges and keeps the operation compatible with the existing
+// luminance-based EASU result.
+float subpixelEdgeAA(vec2 uv, vec2 texel, EasuDir ed, float edgeStrength, float upscale) {
+    if (upscale <= 1.15 || edgeStrength <= 0.02)
+        return 0.0;
+
+    // ed.dir follows the local gradient (across the edge); its perpendicular
+    // is therefore along the edge, where sampling is useful for reducing
+    // staircase phase changes without crossing the edge as aggressively.
+    vec2 tangent = vec2(-ed.dir.y, ed.dir.x);
+
+    // Keep the offsets subpixel at the source resolution. Stronger scaling
+    // gets a little more coverage, but never more than 0.5 source texel.
+    float radius = mix(0.20, 0.50, clamp((upscale - 1.0) / 2.0, 0.0, 1.0));
+    vec2 off = tangent * texel * radius;
+
+    vec3 p0 = texture(texSampler, uv - off).rgb;
+    vec3 p1 = texture(texSampler, uv + off).rgb;
+
+    float y0 = p0.r * 0.5 + p0.g;
+    float y1 = p1.r * 0.5 + p1.g;
+    float avgY = 0.5 * (y0 + y1);
+
+    // The correction is deliberately small. It is an anti-aliasing resolve,
+    // not another sharpening pass.
+    float strength = 0.12 * clamp((upscale - 1.0) / 1.0, 0.0, 1.0);
+    strength *= smoothstep(0.02, 0.18, edgeStrength);
+    return (avgY) * strength;
+}
+
+
+EasuDir easuDirection(vec2 uv, vec2 texel) {
+    vec3 sA = texture(texSampler, uv + vec2(0.0, -texel.y)).rgb;
+    vec3 sB = texture(texSampler, uv + vec2(-texel.x, 0.0)).rgb;
+    vec3 sC = texture(texSampler, uv).rgb;
+    vec3 sD = texture(texSampler, uv + vec2( texel.x, 0.0)).rgb;
+    vec3 sE = texture(texSampler, uv + vec2(0.0,  texel.y)).rgb;
+
+    float lA = sA.r * 0.5 + sA.g;
+    float lB = sB.r * 0.5 + sB.g;
+    float lC = sC.r * 0.5 + sC.g;
+    float lD = sD.r * 0.5 + sD.g;
+    float lE = sE.r * 0.5 + sE.g;
+
+    float dc = lD - lC, cb = lC - lB;
+    float lenX = max(abs(dc), abs(cb));
+    lenX = 1.0 / max(lenX, 1.0e-6);
+    float dirX = lD - lB;
+    lenX = clamp(abs(dirX) * lenX, 0.0, 1.0);
+    lenX *= lenX;
+
+    float ec = lE - lC, ca = lC - lA;
+    float lenY = max(abs(ec), abs(ca));
+    lenY = 1.0 / max(lenY, 1.0e-6);
+    float dirY = lE - lA;
+    lenY = clamp(abs(dirY) * lenY, 0.0, 1.0);
+    lenY *= lenY;
+
+    vec2 dir = vec2(dirX, dirY);
+    float len = lenX + lenY;
+
+    // Normalize direction, guarding the near-zero case exactly like AMD's
+    // `zro` branch (master uses 1/32768 here -- a normalization guard, not
+    // the coarser 1/64 early-out fsr.txt's fused mobile pass uses to skip
+    // its whole tap loop; we're not replicating that shortcut, we always
+    // run the 12-tap loop below, so the tighter guard is the correct one).
+    vec2 dir2 = dir * dir;
+    float dirR = dir2.x + dir2.y;
+    if (dirR < 1.0 / 32768.0) {
+        dir = vec2(1.0, 0.0);
+    } else {
+        dir *= inversesqrt(dirR);
+    }
+
+    len *= 0.5;
+    len *= len;
+    float stretch = (dir.x * dir.x + dir.y * dir.y) / max(max(abs(dir.x), abs(dir.y)), 1.0e-6);
+    vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
+    float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
+    float clp = 1.0 / max(lob, 1.0e-6);
+
+    EasuDir ed;
+    ed.dir = dir;
+    ed.len2 = len2;
+    ed.lob = lob;
+    ed.clp = clp;
+    return ed;
+}
+
+// weightY's spatial term is now the real EASU tap weight, ported verbatim
+// from FsrEasuTapF (ffx_fsr1.h): rotate the tap offset into the gradient
+// frame, scale anisotropically by len2, then run the two-window Lanczos-2
+// approximation (wA, wB) AMD ships. This replaces the old isotropic
+// (dx*dx+dy*dy) distance term entirely -- fastLanczos2 is gone, since
+// nothing else in this file called it.
+//
+// The existing value/range term (clamp(abs(c)*std,0,1)) isn't part of
+// stock EASU -- it's this file's own bilateral-style "down-weight taps
+// whose value differs a lot from center" mechanism. Kept as a multiplier
+// on top of the real EASU weight rather than dropped, so both mechanisms
+// combine instead of one replacing the other.
+//
+// DEVIATION FROM AMD'S REFERENCE: `spatialFactor` (from sharpAmt, see
+// SHARP_DEFAULT in main() -- not currently host-controlled, see comment
+// there) is
+// folded in as an extra scale on d2 before the clp clip, preserving this
+// file's existing user-facing sharpness knob (higher sharpAmt -> narrower
+// kernel), matching its old role under the previous isotropic weightY.
+// AMD's own lob/clp tuning doesn't include this scale; flag it if the
+// sharpness slider's feel changes noticeably from before.
+vec2 weightY(float dx, float dy, float c, float std, float spatialFactor, EasuDir ed) {
+    float vx = dx * ed.dir.x + dy * ed.dir.y;
+    float vy = dx * (-ed.dir.y) + dy * ed.dir.x;
+    vx *= ed.len2.x;
+    vy *= ed.len2.y;
+    float d2 = (vx * vx + vy * vy) * spatialFactor;
+    d2 = min(d2, ed.clp);
+
+    float wB = (2.0 / 5.0) * d2 - 1.0;
+    float wA = ed.lob * d2 - 1.0;
+    wB *= wB;
+    wA *= wA;
+    wB = (25.0 / 16.0) * wB - (25.0 / 16.0 - 1.0);
+    float wEasu = wB * wA;
+
+    float rangeSimilarity = 1.0 - clamp(abs(c) * std, 0.0, 1.0);
+    float w = wEasu * rangeSimilarity;
     return vec2(w, w * c);
 }
 
-// --- NEW: Contrast Adaptive Sharpening (CAS) ---
-vec3 applyCAS(vec3 center, vec2 uv, float sharp) {
+// --- RCAS (Robust Contrast Adaptive Sharpening), ported from AMD FidelityFX
+// FSR 1.0 (see fsr.txt / FsrMobile's combined RCAS block). Replaces the old
+// heuristic applyCAS(): same job (4-tap cardinal adaptive sharpen, called
+// the same way from applyPostFX below) but AMD's actual limiter math instead
+// of a flat "contrast range -> blend weight" heuristic.
+//
+// Per channel, RCAS looks at the min/max of the 4-neighbor ring and computes
+// how far the center pixel sits from that ring in each direction (hitMin /
+// hitMax). The worst-case (most restrictive) channel sets a single "lobe"
+// value that is then used to blend center against the 4 neighbors -- lobe
+// near 0 near strong edges (don't sharpen, avoid ringing/halos), lobe more
+// negative in flat regions (sharpen more). FSR_RCAS_LIMIT bounds how far
+// that can go, same constant AMD ships (0.25 - 1/16).
+//
+// `sharp` keeps the same contract applyPostFX already passes in (the
+// edgeStrength-backed-off casSharp, ~0.3..1.0) and scales the lobe directly,
+// same role the old "* 0.2" constant played.
+vec3 applyRCAS(vec3 e, vec2 uv, float sharp) {
     vec2 texel = vec2(pc.invSrcW, pc.invSrcH);
-    
-    // Sample 4 cardinal neighbors
+
+    // Sample 4 cardinal neighbors (same taps/positions as the old CAS).
     vec3 b = texture(texSampler, uv + vec2( 0.0,    -texel.y)).rgb;
     vec3 d = texture(texSampler, uv + vec2(-texel.x,  0.0   )).rgb;
     vec3 f = texture(texSampler, uv + vec2( texel.x,  0.0   )).rgb;
     vec3 h = texture(texSampler, uv + vec2( 0.0,     texel.y)).rgb;
 
-    vec3 mn = min(min(b, d), min(f, h));
-    vec3 mx = max(max(b, d), max(f, h));
-    
-    // Calculate local contrast
-    vec3 range = mx - mn;
-    float maxContrast = max(max(range.r, range.g), range.b);
-    
-    // Adaptive magic: If contrast is high (strong edge), weight drops to 0.
-    // If contrast is low (flat), weight boosts to 1.0.
-    float adaptiveWeight = clamp(1.0 - (maxContrast * 1.5), 0.0, 1.0);
-    
-    // Standard blur from 4 neighbors
-    vec3 blur = (b + d + f + h) * 0.25;
-    
-    // Apply adaptive sharpening
-    vec3 result = center + (center - blur) * (sharp * 0.2) * adaptiveWeight;
+    vec3 mn4 = min(min(b, d), min(f, h));
+    vec3 mx4 = max(max(b, d), max(f, h));
+
+    // Limiters -- distance from center's ring extremes, high-precision rcp
+    // per AMD's note (tonality shifts visibly if this rcp is too coarse).
+    // Denominators are guarded the same way the rest of this file guards
+    // rcps (max(x, 1e-6) / min(x, -1e-6)) rather than AMD's raw rcp.
+    vec3 hitMin = mn4 / max(4.0 * mx4, 1.0e-6);
+    vec3 hitMax = (1.0 - mx4) / min(4.0 * mn4 - 4.0, -1.0e-6);
+    vec3 lobeRGB = max(-hitMin, hitMax);
+
+    const float FSR_RCAS_LIMIT = 0.25 - (1.0 / 16.0);
+    float lobe = max(-FSR_RCAS_LIMIT,
+                      min(max(max(lobeRGB.r, lobeRGB.g), lobeRGB.b), 0.0)) * sharp;
+
+    // Resolve: blend center against the ring using the shared lobe weight.
+    float rcpL = 1.0 / (4.0 * lobe + 1.0);
+    vec3 result = (lobe * (b + d + f + h) + e) * rcpL;
     return clamp(result, 0.0, 1.0);
 }
 
-// --- DLS handles ONLY color/contrast now -- CAS handles sharpening ---
+// --- DLS handles ONLY color/contrast now -- RCAS handles sharpening ---
 // MICRO-OPT: this used to also fetch a 4-tap cardinal blur (uv, texel, the
 // four texture() calls below) to feed a sharpening term that was already
 // zeroed out (SHARP = 0.0) -- the blur was computed and then never read.
@@ -133,14 +329,14 @@ vec3 applyNatural(vec3 c) {
 // --- UPDATED POST-PROCESSING CHAIN ---
 // edgeStrength in [0,1]: how much the directional resample in main() already
 // corrected this pixel (0 = fast path / flat region, 1 = max correction).
-// CAS's neighbor taps sample the raw source texture rather than this
-// already-corrected center pixel, so running CAS at full strength on a pixel
+// RCAS's neighbor taps sample the raw source texture rather than this
+// already-corrected center pixel, so running RCAS at full strength on a pixel
 // the NIS pass above already reconstructed risks stacking two sharpeners on
-// the same edge (halo / over-sharpen). Back CAS off proportionally instead.
+// the same edge (halo / over-sharpen). Back RCAS off proportionally instead.
 void applyPostFX(inout vec3 rgb, vec2 uv, float edgeStrength) {
-    // 1. CAS handles adaptive sharpening without creating blocky halos.
+    // 1. RCAS handles adaptive sharpening without creating blocky halos.
     float casSharp = mix(1.0, 0.3, clamp(edgeStrength, 0.0, 1.0));
-    rgb = applyCAS(rgb, uv, casSharp);     
+    rgb = applyRCAS(rgb, uv, casSharp);    
     
     // 2. DLS handles color vibrancy and contrast (sharpening is zeroed inside).
     rgb = applyDLS(rgb);     
@@ -224,26 +420,51 @@ void main() {
         abs(upDown.x) + abs(upDown.y) + abs(upDown.z) + abs(upDown.w);
     float std = 2.181818 / max(sum, 1.0e-6);
 
-    // MICRO-OPT: clamp(pc.sharpness, 0, 1) was recomputed three times below
-    // (here, edgeSharpness, maxDelta) for the same value each time. Hoisted.
-    float sharpAmt = clamp(pc.sharpness, 0.0, 1.0);
+    // pc.sharpness is declared in the push constant block but nothing on
+    // the host side currently calls vkCmdPushConstants (or equivalent) to
+    // write it -- per the Vulkan spec, push constant memory has NO
+    // guaranteed initial value until something writes to it, so reading it
+    // unwritten means whatever was left over from a prior draw, or
+    // uninitialized driver memory. clamp() on a resulting NaN is undefined
+    // behavior in GLSL too, so this isn't a "gets a bland default" risk --
+    // it can silently corrupt the sharpening chain (feeds spatialFactor,
+    // edgeSharpness, maxDelta below).
+    //
+    // Using a fixed local default instead until that's wired up. To make
+    // it host-controlled later: replace SHARP_DEFAULT below with
+    // clamp(pc.sharpness, 0.0, 1.0) once vkCmdPushConstants actually writes
+    // this field -- nothing else here needs to change.
+    const float SHARP_DEFAULT = 0.5; // 0 = softest, 1 = sharpest of the mix() ranges below
+    float sharpAmt = SHARP_DEFAULT;
 
-    float spatialFactor = mix(0.40, 0.65, sharpAmt);
+    vec2 footprint = sourceFootprint();
+    float spatialFactor = scaleAwareSpatialFactor(sharpAmt, footprint);
 
-    vec2 aWY = weightY(pl.x,       pl.y + 1.0, upDown.x, std, spatialFactor);
-    aWY += weightY(pl.x - 1.0, pl.y + 1.0, upDown.y, std, spatialFactor);
-    aWY += weightY(pl.x - 1.0, pl.y - 2.0, upDown.z, std, spatialFactor);
-    aWY += weightY(pl.x,       pl.y - 2.0, upDown.w, std, spatialFactor);
-    aWY += weightY(pl.x + 1.0, pl.y - 1.0, left.x,   std, spatialFactor);
-    aWY += weightY(pl.x,       pl.y - 1.0, left.y,   std, spatialFactor);
-    aWY += weightY(pl.x,       pl.y,       left.z,   std, spatialFactor);
-    aWY += weightY(pl.x + 1.0, pl.y,       left.w,   std, spatialFactor);
-    aWY += weightY(pl.x - 1.0, pl.y - 1.0, right.x,  std, spatialFactor);
-    aWY += weightY(pl.x - 2.0, pl.y - 1.0, right.y,  std, spatialFactor);
-    aWY += weightY(pl.x - 2.0, pl.y,       right.z,  std, spatialFactor);
-    aWY += weightY(pl.x - 1.0, pl.y,       right.w,  std, spatialFactor);
+    // EASU direction/anisotropy, computed once per pixel and shared by all
+    // 12 taps below (see easuDirection's doc comment above).
+    EasuDir ed = easuDirection(fragTexCoord, step);
+
+    vec2 aWY = weightY(pl.x,       pl.y + 1.0, upDown.x, std, spatialFactor, ed);
+    aWY += weightY(pl.x - 1.0, pl.y + 1.0, upDown.y, std, spatialFactor, ed);
+    aWY += weightY(pl.x - 1.0, pl.y - 2.0, upDown.z, std, spatialFactor, ed);
+    aWY += weightY(pl.x,       pl.y - 2.0, upDown.w, std, spatialFactor, ed);
+    aWY += weightY(pl.x + 1.0, pl.y - 1.0, left.x,   std, spatialFactor, ed);
+    aWY += weightY(pl.x,       pl.y - 1.0, left.y,   std, spatialFactor, ed);
+    aWY += weightY(pl.x,       pl.y,       left.z,   std, spatialFactor, ed);
+    aWY += weightY(pl.x + 1.0, pl.y,       left.w,   std, spatialFactor, ed);
+    aWY += weightY(pl.x - 1.0, pl.y - 1.0, right.x,  std, spatialFactor, ed);
+    aWY += weightY(pl.x - 2.0, pl.y - 1.0, right.y,  std, spatialFactor, ed);
+    aWY += weightY(pl.x - 2.0, pl.y,       right.z,  std, spatialFactor, ed);
+    aWY += weightY(pl.x - 1.0, pl.y,       right.w,  std, spatialFactor, ed);
 
     float finalY = aWY.y / max(aWY.x, 1.0e-6);
+
+    // Low-resolution edge resolve: use the reconstructed EASU edge strength
+    // as the gate so flat areas remain untouched. The center value is added
+    // outside this helper because the helper returns only the correction.
+    float preAAEdge = abs(finalY - centerG);
+    float upscale = sourceUpscaleFactor(footprint);
+    finalY += subpixelEdgeAA(fragTexCoord, step, ed, preAAEdge, upscale);
 
     float maxY = max(max(left.y, left.z), max(right.x, right.w)) + mean;
     float minY = min(min(left.y, left.z), min(right.x, right.w)) + mean;
@@ -270,9 +491,16 @@ void main() {
     result.a   = (pc.useTexAlpha != 0) ? center.a : 1.0;
 
     // How much correction this pixel already got, normalized to [0,1] -- fed
-    // into applyPostFX to back CAS off on pixels the resample above already
+    // into applyPostFX to back RCAS off on pixels the resample above already
     // sharpened (see comment on applyPostFX).
     float edgeStrength = abs(deltaY) / max(maxDelta, 1.0e-6);
+
+    // Keep RCAS useful after reconstruction, but avoid excessive sharpening
+    // when the source is already near/native resolution. The helper still
+    // caps the actual RCAS limiter, so this is a small quality bias only.
+    float scaleSharp = 1.0 + clamp((upscale - 1.0) * 0.06, 0.0, 0.10);
+    edgeStrength = clamp(edgeStrength / scaleSharp, 0.0, 1.0);
+
     applyPostFX(result.rgb, fragTexCoord, edgeStrength);
 
     outColor = result;

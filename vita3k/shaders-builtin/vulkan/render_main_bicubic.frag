@@ -43,6 +43,84 @@ layout(location = 0) out vec4 outColor;
 // texture() already returns the full RGB, this just stops discarding .r.
 struct EasuDir { vec2 dir; vec2 len2; float lob; float clp; };
 
+// Estimate the source-texel footprint of one destination pixel.
+// The screen-filter host draws the fullscreen quad over the destination
+// viewport while fragTexCoord spans the source image, so derivatives give us
+// the actual source-pixel footprint without adding a Vita3K-specific uniform.
+//
+// footprint < 1: upscaling (one output pixel sees less than one source texel)
+// footprint ~= 1: native scale
+// footprint > 1: downscaling
+vec2 sourceFootprint() {
+    vec2 dx = abs(dFdx(fragTexCoord)) * vec2(pc.srcW, pc.srcH);
+    vec2 dy = abs(dFdy(fragTexCoord)) * vec2(pc.srcW, pc.srcH);
+
+    // Use the larger derivative rather than dx+dy. For a 2x upscale this
+    // correctly reports ~0.5 source texel per output pixel, instead of 1.0.
+    return max(max(dx, dy), vec2(1.0e-6));
+}
+
+float sourceUpscaleFactor(vec2 footprint) {
+    float sx = 1.0 / max(footprint.x, 1.0e-6);
+    float sy = 1.0 / max(footprint.y, 1.0e-6);
+    // Use the geometric mean so a non-uniform scale (e.g. Vita 960x544 to
+    // 1920x1080) is represented by one stable quality factor.
+    return sqrt(max(sx * sy, 1.0));
+}
+
+// CONTENT-AWARE POST FX:
+// Color processing below reuses EASU's existing center/neighborhood samples.
+// No additional texture taps are introduced for shadow/detail awareness.
+// This is specifically intended to prevent dark textured areas from losing
+// contrast/detail after DLS + HDR + Natural while preserving those effects in
+// ordinary midtone/bright regions.
+//
+// // Scale-aware EASU kernel width. At large upscales the reconstruction is
+// allowed to use a slightly broader footprint; at 1:1 it falls back to the
+// existing sharpness-controlled kernel. This is intentionally bounded.
+float scaleAwareSpatialFactor(float sharpAmt, vec2 footprint) {
+    float upscale = sourceUpscaleFactor(footprint);
+    float lowResBoost = clamp((upscale - 1.0) * 0.075, 0.0, 0.12);
+    return mix(0.40, 0.65, sharpAmt) * (1.0 - lowResBoost);
+}
+
+// A very small directional pre-resolve for low-resolution upscaling.
+// EASU reconstructs the edge, while this 3-sample tangent resolve reduces
+// the "stair-step" phase changes that remain on diagonals when the source
+// rasterization is substantially below the display resolution.
+//
+// We only return a luminance correction. This avoids washing chroma across
+// colored edges and keeps the operation compatible with the existing
+// luminance-based EASU result.
+float subpixelEdgeAA(vec2 uv, vec2 texel, EasuDir ed, float edgeStrength, float upscale) {
+    if (upscale <= 1.15 || edgeStrength <= 0.02)
+        return 0.0;
+
+    // ed.dir follows the local gradient (across the edge); its perpendicular
+    // is therefore along the edge, where sampling is useful for reducing
+    // staircase phase changes without crossing the edge as aggressively.
+    vec2 tangent = vec2(-ed.dir.y, ed.dir.x);
+
+    // Keep the offsets subpixel at the source resolution. Stronger scaling
+    // gets a little more coverage, but never more than 0.5 source texel.
+    float radius = mix(0.20, 0.50, clamp((upscale - 1.0) / 2.0, 0.0, 1.0));
+    vec2 off = tangent * texel * radius;
+
+    vec3 p0 = texture(texSampler, uv - off).rgb;
+    vec3 p1 = texture(texSampler, uv + off).rgb;
+
+    float y0 = p0.r * 0.5 + p0.g;
+    float y1 = p1.r * 0.5 + p1.g;
+    float avgY = 0.5 * (y0 + y1);
+
+    // The correction is deliberately small. It is an anti-aliasing resolve,
+    // not another sharpening pass.
+    float strength = 0.12 * clamp((upscale - 1.0) / 1.0, 0.0, 1.0);
+    strength *= smoothstep(0.02, 0.18, edgeStrength);
+    return (avgY) * strength;
+}
+
+
 EasuDir easuDirection(vec2 uv, vec2 texel) {
     vec3 sA = texture(texSampler, uv + vec2(0.0, -texel.y)).rgb;
     vec3 sB = texture(texSampler, uv + vec2(-texel.x, 0.0)).rgb;
@@ -262,24 +340,77 @@ vec3 applyNatural(vec3 c) {
 // already-corrected center pixel, so running RCAS at full strength on a pixel
 // the NIS pass above already reconstructed risks stacking two sharpeners on
 // the same edge (halo / over-sharpen). Back RCAS off proportionally instead.
-void applyPostFX(inout vec3 rgb, vec2 uv, float edgeStrength) {
-    // 1. RCAS handles adaptive sharpening without creating blocky halos.
+// Content-aware post processing.
+//
+// IMPORTANT: this version deliberately adds NO texture taps.
+// It reuses information already calculated by the EASU pass:
+//   - centerG: source center luminance proxy
+//   - localMean: mean of the already-gathered neighborhood
+//   - edgeStrength: amount of EASU luminance correction
+//
+// The goal is to stop DLS/HDR/Natural from crushing fine information in
+// dark regions while retaining the original look elsewhere.
+void applyPostFX(inout vec3 rgb,
+                 vec2 uv,
+                 float edgeStrength,
+                 float centerLuma,
+                 float localMean) {
+
+    // Dark-region detector. Keep the transition soft so there is no visible
+    // brightness boundary around a shadow threshold.
+    float shadowMask = 1.0 - smoothstep(0.055, 0.30, centerLuma);
+
+    // Reuse the already-sampled neighborhood to estimate local variation.
+    // This is intentionally cheap: no new texture() calls.
+    float localVariation = abs(centerLuma - localMean);
+    float detailMask = smoothstep(0.012, 0.075, localVariation);
+
+    // If a region is both dark and locally detailed, preserve it strongly.
+    // Flat dark regions receive much less protection.
+    float darkDetailProtect = shadowMask * detailMask;
+
+    // EASU edge correction is another useful signal. A strong reconstructed
+    // edge in a dark region is exactly where we do not want post-processing
+    // to erase the recovered texture.
+    darkDetailProtect *= mix(0.65, 1.0, clamp(edgeStrength, 0.0, 1.0));
+
+    // Protect the shadow/detail region, but don't completely disable the
+    // user's post-processing. 0.72 means at maximum protection 72% of the
+    // enhancement is backed off.
+    float fxStrength = 1.0 - 0.72 * clamp(darkDetailProtect, 0.0, 1.0);
+
+    // 1. RCAS: keep it active, but reduce it slightly in already-reconstructed
+    // edges. This is the same zero-extra-tap RCAS path as before.
     float casSharp = mix(1.0, 0.3, clamp(edgeStrength, 0.0, 1.0));
-    rgb = applyRCAS(rgb, uv, casSharp);    
-    
-    // 2. DLS handles color vibrancy and contrast (sharpening is zeroed inside).
-    rgb = applyDLS(rgb);     
-    
-    // 3. HDR handles the glowing highlights.
-    rgb = applyHDR(rgb, uv);          
-    
-    // 4. Natural is UNCOMMENTED by default, but optional. 
-    // If you want the warm cinematic tone, remove the // below.
-    rgb = applyNatural(rgb);          
-    
-    // 5. Optional CRT        
-        // rgb = applyCRT(rgb, uv);
-    }
+    casSharp = mix(0.55, casSharp, fxStrength);
+    rgb = applyRCAS(rgb, uv, casSharp);
+
+    // Preserve the pre-color-processing result for a final shadow/detail
+    // guard. This costs only registers/ALU, not texture bandwidth.
+    vec3 beforeColorFX = rgb;
+
+    // 2. DLS: contrast/saturation enhancement.
+    vec3 dls = applyDLS(rgb);
+    rgb = mix(rgb, dls, fxStrength);
+
+    // 3. HDR: existing four-diagonal-tap implementation. We do not add taps.
+    // In dark detailed areas its nonlinear response is backed off.
+    vec3 hdr = applyHDR(rgb, uv);
+    rgb = mix(rgb, hdr, fxStrength);
+
+    // 4. Natural: existing YIQ/gamma-style processing, again attenuated in
+    // dark detailed regions instead of globally disabling it.
+    vec3 natural = applyNatural(rgb);
+    rgb = mix(rgb, natural, fxStrength);
+
+    // Final conservative luminance/detail guard.
+    //
+    // If the color pipeline has moved a dark detailed pixel substantially,
+    // pull it partway back toward the pre-color-FX value. This is intentionally
+    // a blend rather than an RGB rescale, so hue/saturation are not destabilized.
+    float guard = 0.35 * clamp(darkDetailProtect, 0.0, 1.0);
+    rgb = mix(rgb, beforeColorFX, guard);
+}
 
 void main() {
     highp vec2 step = vec2(pc.invSrcW, pc.invSrcH);
@@ -317,7 +448,9 @@ void main() {
     if (edgeVote <= EDGE_THRESHOLD - EDGE_TAPER_BAND) {
         // Well inside a flat region -- skip the directional resample entirely.
         vec3 rgb = center.rgb;
-        applyPostFX(rgb, fragTexCoord, 0.0);
+        // No neighborhood EASU data exists on this fast path, so use the
+        // center itself as the local mean. This adds no taps.
+        applyPostFX(rgb, fragTexCoord, 0.0, centerG, centerG);
         outColor = vec4(rgb, (pc.useTexAlpha != 0) ? center.a : 1.0);
         return;
     }
@@ -366,7 +499,8 @@ void main() {
     const float SHARP_DEFAULT = 0.5; // 0 = softest, 1 = sharpest of the mix() ranges below
     float sharpAmt = SHARP_DEFAULT;
 
-    float spatialFactor = mix(0.40, 0.65, sharpAmt);
+    vec2 footprint = sourceFootprint();
+    float spatialFactor = scaleAwareSpatialFactor(sharpAmt, footprint);
 
     // EASU direction/anisotropy, computed once per pixel and shared by all
     // 12 taps below (see easuDirection's doc comment above).
@@ -386,6 +520,13 @@ void main() {
     aWY += weightY(pl.x - 1.0, pl.y,       right.w,  std, spatialFactor, ed);
 
     float finalY = aWY.y / max(aWY.x, 1.0e-6);
+
+    // Low-resolution edge resolve: use the reconstructed EASU edge strength
+    // as the gate so flat areas remain untouched. The center value is added
+    // outside this helper because the helper returns only the correction.
+    float preAAEdge = abs(finalY - centerG);
+    float upscale = sourceUpscaleFactor(footprint);
+    finalY += subpixelEdgeAA(fragTexCoord, step, ed, preAAEdge, upscale);
 
     float maxY = max(max(left.y, left.z), max(right.x, right.w)) + mean;
     float minY = min(min(left.y, left.z), min(right.x, right.w)) + mean;
@@ -415,7 +556,16 @@ void main() {
     // into applyPostFX to back RCAS off on pixels the resample above already
     // sharpened (see comment on applyPostFX).
     float edgeStrength = abs(deltaY) / max(maxDelta, 1.0e-6);
-    applyPostFX(result.rgb, fragTexCoord, edgeStrength);
+
+    // Keep RCAS useful after reconstruction, but avoid excessive sharpening
+    // when the source is already near/native resolution. The helper still
+    // caps the actual RCAS limiter, so this is a small quality bias only.
+    float scaleSharp = 1.0 + clamp((upscale - 1.0) * 0.06, 0.0, 0.10);
+    edgeStrength = clamp(edgeStrength / scaleSharp, 0.0, 1.0);
+
+    // `mean` is already computed from the EASU gather neighborhood, so the
+    // content-aware color guard costs no additional texture reads.
+    applyPostFX(result.rgb, fragTexCoord, edgeStrength, centerG, mean);
 
     outColor = result;
 }
