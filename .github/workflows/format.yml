@@ -1,9 +1,8 @@
-name: Format Check
+name: "Format Check"
 
 on:
-  workflow_dispatch::
+  workflow_dispatch:
 
-  
 jobs:
   format-check:
     name: Format Check (${{ matrix.path }})
