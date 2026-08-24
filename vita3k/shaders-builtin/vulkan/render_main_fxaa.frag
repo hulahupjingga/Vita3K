@@ -49,7 +49,7 @@ layout(location = 0) out vec4 outColor;
 // (atyuwen, "Optimizing AMD FSR for Mobiles", section 5) -- not full RGB
 // luma, but not this file's G-only shortcut either. Costs nothing extra:
 // texture() already returns the full RGB, this just stops discarding .r.
-struct EasuDir { vec2 dir; vec2 len2; float lob; float clp; };
+struct EasuDir { vec2 dir; vec2 len2; float lob; float clp; float aniso; };
 
 // Estimate the source-texel footprint of one destination pixel.
 // The screen-filter host draws the fullscreen quad over the destination
@@ -159,6 +159,12 @@ EasuDir easuDirection(vec2 uv, vec2 texel) {
     vec2 dir = vec2(dirX, dirY);
     float len = lenX + lenY;
 
+    // NEW: structure-tensor anisotropy (see file-1 comment for full
+    // rationale). Computed from lenX/lenY this function already derives,
+    // before AMD's stretch/len2 blend mixes them together -- no extra taps.
+    // Near 1 = coherent directional edge, near 0 = isotropic noise/dither.
+    float aniso = clamp(abs(lenX - lenY) / max(lenX + lenY, 1.0e-6), 0.0, 1.0);
+
     // Normalize direction, guarding the near-zero case exactly like AMD's
     // `zro` branch (master uses 1/32768 here -- a normalization guard, not
     // the coarser 1/64 early-out fsr.txt's fused mobile pass uses to skip
@@ -184,6 +190,7 @@ EasuDir easuDirection(vec2 uv, vec2 texel) {
     ed.len2 = len2;
     ed.lob = lob;
     ed.clp = clp;
+    ed.aniso = aniso;
     return ed;
 }
 
@@ -413,7 +420,8 @@ void applyPostFX(inout vec3 rgb,
                  vec2 uv,
                  float edgeStrength,
                  float centerLuma,
-                 float localMean) {
+                 float localMean,
+                 float aniso) {
 
     // Dark-region detector. Keep the transition soft so there is no visible
     // brightness boundary around a shadow threshold.
@@ -444,6 +452,20 @@ void applyPostFX(inout vec3 rgb,
     // Max local RCAS bias is 0.75 instead of the previous 1.15.
     float casSharp = mix(0.75, 0.3, clamp(edgeStrength, 0.0, 1.0));
     casSharp = mix(0.45, casSharp, fxStrength);
+
+    // Real noise-vs-edge discriminator (see file-1 comment for full
+    // rationale): a surface can have enough local variance to escape
+    // detailMask's "flat" bucket while still being isotropic noise rather
+    // than a coherent edge. structuredDetail is detailMask gated by aniso,
+    // so noisy-but-textured content (e.g. a sign board) reads as low
+    // structured detail even where raw detailMask alone would not catch it.
+    // Reused below for iMMERSE's detail gate too, instead of raw detailMask.
+    float structuredDetail = detailMask * clamp(aniso, 0.0, 1.0);
+    float flatMask = 1.0 - detailMask;
+    float isotropicNoise = detailMask * (1.0 - clamp(aniso, 0.0, 1.0));
+    float noiseSuppress = max(flatMask, isotropicNoise);
+    casSharp = mix(casSharp, casSharp * 0.6, noiseSuppress * (1.0 - shadowMask));
+
     rgb = applyRCAS(rgb, uv, casSharp);
 
     // Preserve the pre-color-processing result for a final shadow/detail
@@ -475,11 +497,13 @@ void applyPostFX(inout vec3 rgb,
     // is where EASU+RCAS ringing actually lives (the halo sits around a
     // hard edge, not on its exact center pixel).
     float immerseEdgeGate = 1.0 - 0.85 * smoothstep(0.15, 0.6, clamp(edgeStrength, 0.0, 1.0));
-    // Detail-gate floor lowered from 0.65 -> 0.20: at detailMask=0 (flat,
-    // low-variation content like a plain sign board) iMMERSE was still
-    // running at 65% strength, reopening the flat-region noise-amplification
-    // problem the RCAS ceiling change above was meant to close.
-    float immerseDetailGate = mix(0.20, 1.0, detailMask);
+    // Now gated on structuredDetail instead of raw detailMask: the earlier
+    // fix (floor 0.65 -> 0.20) was a values-only guess at the same problem
+    // RCAS has -- detailMask alone can't tell a noisy flat surface from a
+    // genuinely detailed one. structuredDetail (detailMask * aniso) already
+    // solves that upstream, so iMMERSE gets the same real discrimination
+    // RCAS's noiseSuppress above gets, rather than a separately-tuned floor.
+    float immerseDetailGate = mix(0.20, 1.0, structuredDetail);
     // Base amount lowered from 0.30 -> 0.18: this is a third sharpening
     // operator stacked after EASU and RCAS with no shared budget between
     // them, so its own contribution needs to be smaller than it would be
@@ -560,7 +584,7 @@ void main() {
         vec3 rgb = center.rgb;
         // No neighborhood EASU data exists on this fast path, so use the
         // center itself as the local mean. This adds no taps.
-        applyPostFX(rgb, fragTexCoord, 0.0, centerG, centerG);
+        applyPostFX(rgb, fragTexCoord, 0.0, centerG, centerG, 0.0);
         outColor = vec4(rgb, (pc.useTexAlpha != 0) ? center.a : 1.0);
         return;
     }
@@ -683,7 +707,7 @@ void main() {
 
     // `mean` is already computed from the EASU gather neighborhood, so the
     // content-aware color guard costs no additional texture reads.
-    applyPostFX(result.rgb, fragTexCoord, edgeStrength, centerG, mean);
+    applyPostFX(result.rgb, fragTexCoord, edgeStrength, centerG, mean, ed.aniso);
 
     outColor = result;
 }

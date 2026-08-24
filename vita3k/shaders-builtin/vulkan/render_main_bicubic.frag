@@ -41,7 +41,7 @@ layout(location = 0) out vec4 outColor;
 // (atyuwen, "Optimizing AMD FSR for Mobiles", section 5) -- not full RGB
 // luma, but not this file's G-only shortcut either. Costs nothing extra:
 // texture() already returns the full RGB, this just stops discarding .r.
-struct EasuDir { vec2 dir; vec2 len2; float lob; float clp; };
+struct EasuDir { vec2 dir; vec2 len2; float lob; float clp; float aniso; };
 
 // Estimate the source-texel footprint of one destination pixel.
 // The screen-filter host draws the fullscreen quad over the destination
@@ -151,6 +151,20 @@ EasuDir easuDirection(vec2 uv, vec2 texel) {
     vec2 dir = vec2(dirX, dirY);
     float len = lenX + lenY;
 
+    // NEW: structure-tensor anisotropy, computed from the same lenX/lenY
+    // this function already derives for the EASU resample direction --
+    // no extra taps. lenX/lenY are each in [0,1] and measure gradient
+    // strength along one axis independently, before AMD's stretch/len2
+    // blend below mixes them together (which loses this distinction).
+    //
+    // A real edge (sign lettering stroke, hair line, brick joint) has one
+    // axis's gradient clearly dominant -- anisotropic, aniso near 1.
+    // Isotropic noise (JPEG block noise, texture dither) has lenX~=lenY --
+    // aniso near 0. This is what applyPostFX's detailMask alone can't
+    // tell apart, since it only looks at a single scalar local-variation
+    // number with no directional information.
+    float aniso = clamp(abs(lenX - lenY) / max(lenX + lenY, 1.0e-6), 0.0, 1.0);
+
     // Normalize direction, guarding the near-zero case exactly like AMD's
     // `zro` branch (master uses 1/32768 here -- a normalization guard, not
     // the coarser 1/64 early-out fsr.txt's fused mobile pass uses to skip
@@ -176,6 +190,7 @@ EasuDir easuDirection(vec2 uv, vec2 texel) {
     ed.len2 = len2;
     ed.lob = lob;
     ed.clp = clp;
+    ed.aniso = aniso;
     return ed;
 }
 
@@ -351,6 +366,9 @@ vec3 applyNatural(vec3 c) {
 //   - centerG: source center luminance proxy
 //   - localMean: mean of the already-gathered neighborhood
 //   - edgeStrength: amount of EASU luminance correction
+//   - aniso: structure-tensor anisotropy from easuDirection (0 = isotropic
+//     / noise-like, 1 = coherent directional edge). Also free -- computed
+//     from EasuDir's existing lenX/lenY, no new taps.
 //
 // The goal is to stop DLS/HDR/Natural from crushing fine information in
 // dark regions while retaining the original look elsewhere.
@@ -358,7 +376,8 @@ void applyPostFX(inout vec3 rgb,
                  vec2 uv,
                  float edgeStrength,
                  float centerLuma,
-                 float localMean) {
+                 float localMean,
+                 float aniso) {
 
     // Dark-region detector. Keep the transition soft so there is no visible
     // brightness boundary around a shadow threshold.
@@ -395,13 +414,21 @@ void applyPostFX(inout vec3 rgb,
 
     // Additional guard: darkDetailProtect above only covers dark regions
     // (shadowMask gates on centerLuma < ~0.30), so a flat, NON-dark, noisy
-    // surface gets none of that protection. flatMask below is high when
-    // localVariation is low (same signal detailMask already uses, just
-    // inverted) and is only applied where shadowMask is low, so it never
-    // fights the existing dark-detail guard -- it just closes the gap for
-    // flat midtone/bright surfaces.
+    // surface gets none of that protection.
+    //
+    // flatMask alone (localVariation near 0) misses surfaces like a sign
+    // board that have enough micro-variance to NOT read as "flat" --
+    // detailMask picks them up as "detail" even though that variance has
+    // no coherent direction (it's dither/JPEG noise, not a stroke or
+    // edge). isotropicNoise catches exactly that case: high when there IS
+    // local variation (detailMask) but it's NOT directional (low aniso).
+    // Using max() means either signal alone is enough to trigger the
+    // guard, so genuinely flat surfaces and noisy-but-textured surfaces
+    // are both covered without double-counting where they overlap.
     float flatMask = 1.0 - detailMask;
-    casSharp = mix(casSharp, casSharp * 0.6, flatMask * (1.0 - shadowMask));
+    float isotropicNoise = detailMask * (1.0 - clamp(aniso, 0.0, 1.0));
+    float noiseSuppress = max(flatMask, isotropicNoise);
+    casSharp = mix(casSharp, casSharp * 0.6, noiseSuppress * (1.0 - shadowMask));
 
     rgb = applyRCAS(rgb, uv, casSharp);
 
@@ -470,7 +497,7 @@ void main() {
         vec3 rgb = center.rgb;
         // No neighborhood EASU data exists on this fast path, so use the
         // center itself as the local mean. This adds no taps.
-        applyPostFX(rgb, fragTexCoord, 0.0, centerG, centerG);
+        applyPostFX(rgb, fragTexCoord, 0.0, centerG, centerG, 0.0);
         outColor = vec4(rgb, (pc.useTexAlpha != 0) ? center.a : 1.0);
         return;
     }
@@ -599,7 +626,7 @@ void main() {
 
     // `mean` is already computed from the EASU gather neighborhood, so the
     // content-aware color guard costs no additional texture reads.
-    applyPostFX(result.rgb, fragTexCoord, edgeStrength, centerG, mean);
+    applyPostFX(result.rgb, fragTexCoord, edgeStrength, centerG, mean, ed.aniso);
 
     outColor = result;
 }
