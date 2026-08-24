@@ -1,3 +1,11 @@
+// Single-pass adaptive EASU remaster variant.
+// Reuses existing EASU samples for awareness.
+// Remaster finish adds no texture taps.
+// Combined-sharpening test: RCAS reduced before iMMERSE.
+//
+// Note: this RCAS value is for this custom fragment path. It is separate
+// from Vita3K's built-in compute-FSR RCAS constant.
+
 #version 460 core
 
 precision mediump float;
@@ -68,7 +76,14 @@ float sourceUpscaleFactor(vec2 footprint) {
     return sqrt(max(sx * sy, 1.0));
 }
 
-// Scale-aware EASU kernel width. At large upscales the reconstruction is
+// CONTENT-AWARE POST FX:
+// Color processing below reuses EASU's existing center/neighborhood samples.
+// No additional texture taps are introduced for shadow/detail awareness.
+// This is specifically intended to prevent dark textured areas from losing
+// contrast/detail after DLS + HDR + Natural while preserving those effects in
+// ordinary midtone/bright regions.
+//
+// // Scale-aware EASU kernel width. At large upscales the reconstruction is
 // allowed to use a slightly broader footprint; at 1:1 it falls back to the
 // existing sharpness-controlled kernel. This is intentionally bounded.
 float scaleAwareSpatialFactor(float sharpAmt, vec2 footprint) {
@@ -322,7 +337,10 @@ vec3 applyNatural(vec3 c) {
                        0.95568806, -0.27158179, -1.10817732,
                        0.61985809, -0.64687381,  1.70506455);
     vec3 t = c * toYIQ;
-    t = vec3(pow(t.r, 1.12), t.g * 1.2, t.b * 1.2);
+    // Chroma multiplier lowered from 1.2 -> 1.10 (see applyPostFX's
+    // midtoneMask comment below for why this file has multiple stacked
+    // saturation boosts on the same pixels).
+    t = vec3(pow(t.r, 1.12), t.g * 1.10, t.b * 1.10);
     return clamp(t * toRGB, 0.0, 1.0);
 }
 
@@ -333,24 +351,176 @@ vec3 applyNatural(vec3 c) {
 // already-corrected center pixel, so running RCAS at full strength on a pixel
 // the NIS pass above already reconstructed risks stacking two sharpeners on
 // the same edge (halo / over-sharpen). Back RCAS off proportionally instead.
-void applyPostFX(inout vec3 rgb, vec2 uv, float edgeStrength) {
-    // 1. RCAS handles adaptive sharpening without creating blocky halos.
-    float casSharp = mix(1.0, 0.3, clamp(edgeStrength, 0.0, 1.0));
-    rgb = applyRCAS(rgb, uv, casSharp);    
-    
-    // 2. DLS handles color vibrancy and contrast (sharpening is zeroed inside).
-    rgb = applyDLS(rgb);     
-    
-    // 3. HDR handles the glowing highlights.
-    rgb = applyHDR(rgb, uv);          
-    
-    // 4. Natural is UNCOMMENTED by default, but optional. 
-    // If you want the warm cinematic tone, remove the // below.
-    rgb = applyNatural(rgb);          
-    
-    // 5. Optional CRT        
-        // rgb = applyCRT(rgb, uv);
-    }
+// Content-aware post processing.
+//
+// IMPORTANT: this version deliberately adds NO texture taps.
+// It reuses information already calculated by the EASU pass:
+//   - centerG: source center luminance proxy
+//   - localMean: mean of the already-gathered neighborhood
+//   - edgeStrength: amount of EASU luminance correction
+//
+// The goal is to stop DLS/HDR/Natural from crushing fine information in
+// dark regions while retaining the original look elsewhere.
+// MartyMods Sharpen source.
+//
+// This is the SIMPLE preset only: four cardinal color taps. The supplied
+// Advanced preset additionally depends on a depth texture, which this
+// Vita3K single-sampler pipeline does not currently bind.
+//
+// Cost: +4 color texture taps when enabled.
+// It operates around the already reconstructed center, while the neighbor
+// taps come from the source image. This is therefore a conservative
+// "source-detail residual" adaptation rather than a literal second pass.
+vec3 immerseRemap(vec3 x, vec3 c, float alpha) {
+    const vec3 S = vec3(6.0);
+    vec3 bsx = 0.7 * S * (x - c);
+    bsx = clamp(bsx, vec3(-1.5707963), vec3(1.5707963));
+    vec3 curve = alpha * 0.7 *
+                 (sin(bsx * 3.14159265) + tanh(bsx * 4.0)) / S;
+    return x + curve;
+}
+
+vec3 applyImmerseSimple(vec3 c, vec2 uv, float amount) {
+    vec2 texel = vec2(pc.invSrcW, pc.invSrcH);
+
+    vec3 t0 = texture(texSampler, uv + vec2( texel.x, 0.0)).rgb;
+    vec3 t1 = texture(texSampler, uv + vec2(-texel.x, 0.0)).rgb;
+    vec3 t2 = texture(texSampler, uv + vec2(0.0,  texel.y)).rgb;
+    vec3 t3 = texture(texSampler, uv + vec2(0.0, -texel.y)).rgb;
+
+    float alpha = clamp(amount, 0.0, 1.0);
+
+    vec3 G1 = c * 4.0;
+    vec3 L0 = c * 4.0;
+
+    G1 += (t0 + t1 + t2 + t3) * 2.0;
+    L0 += (immerseRemap(t0, c, alpha) +
+           immerseRemap(t1, c, alpha) +
+           immerseRemap(t2, c, alpha) +
+           immerseRemap(t3, c, alpha)) * 2.0;
+
+    G1 /= 12.0;
+    L0 /= 12.0;
+
+    vec3 residual = c - L0;
+    vec3 sharpened = G1 + residual;
+
+    return mix(c, sharpened, clamp(amount, 0.0, 1.0));
+}
+
+
+void applyPostFX(inout vec3 rgb,
+                 vec2 uv,
+                 float edgeStrength,
+                 float centerLuma,
+                 float localMean) {
+
+    // Dark-region detector. Keep the transition soft so there is no visible
+    // brightness boundary around a shadow threshold.
+    float shadowMask = 1.0 - smoothstep(0.055, 0.30, centerLuma);
+
+    // Reuse the already-sampled neighborhood to estimate local variation.
+    // This is intentionally cheap: no new texture() calls.
+    float localVariation = abs(centerLuma - localMean);
+    float detailMask = smoothstep(0.012, 0.075, localVariation);
+
+    // If a region is both dark and locally detailed, preserve it strongly.
+    // Flat dark regions receive much less protection.
+    float darkDetailProtect = shadowMask * detailMask;
+
+    // EASU edge correction is another useful signal. A strong reconstructed
+    // edge in a dark region is exactly where we do not want post-processing
+    // to erase the recovered texture.
+    darkDetailProtect *= mix(0.65, 1.0, clamp(edgeStrength, 0.0, 1.0));
+
+    // Protect the shadow/detail region, but don't completely disable the
+    // user's post-processing. 0.72 means at maximum protection 72% of the
+    // enhancement is backed off.
+    float fxStrength = 1.0 - 0.72 * clamp(darkDetailProtect, 0.0, 1.0);
+
+    // 1. RCAS: keep it active, but reduce it slightly in already-reconstructed
+    // edges. This is the same zero-extra-tap RCAS path as before.
+    // Combined-sharpening test: reduce RCAS so it does not fight iMMERSE.
+    // Max local RCAS bias is 0.75 instead of the previous 1.15.
+    float casSharp = mix(0.75, 0.3, clamp(edgeStrength, 0.0, 1.0));
+    casSharp = mix(0.45, casSharp, fxStrength);
+    rgb = applyRCAS(rgb, uv, casSharp);
+
+    // Preserve the pre-color-processing result for a final shadow/detail
+    // guard. This costs only registers/ALU, not texture bandwidth.
+    vec3 beforeColorFX = rgb;
+
+    // 2. DLS: contrast/saturation enhancement.
+    vec3 dls = applyDLS(rgb);
+    rgb = mix(rgb, dls, fxStrength);
+
+    // 3. HDR: existing four-diagonal-tap implementation. We do not add taps.
+    // In dark detailed areas its nonlinear response is backed off.
+    vec3 hdr = applyHDR(rgb, uv);
+    rgb = mix(rgb, hdr, fxStrength);
+
+    // 4. Natural: existing YIQ/gamma-style processing, again attenuated in
+    // dark detailed regions instead of globally disabling it.
+    vec3 natural = applyNatural(rgb);
+    rgb = mix(rgb, natural, fxStrength);
+
+    // iMMERSE Simple: local Laplacian/detail recovery using four cardinal
+    // source samples. Kept restrained because RCAS is still active.
+    // Reduce it on strong reconstructed edges to avoid emphasizing
+    // staircase geometry, and retain the existing dark-detail protection.
+    //
+    // Edge gate changed from a linear `1.0 - 0.65*edgeStrength` (floor 0.35
+    // at max edgeStrength) to a smoothstep that also suppresses the
+    // *mid*-edgeStrength shoulder -- that shoulder, not the absolute peak,
+    // is where EASU+RCAS ringing actually lives (the halo sits around a
+    // hard edge, not on its exact center pixel).
+    float immerseEdgeGate = 1.0 - 0.85 * smoothstep(0.15, 0.6, clamp(edgeStrength, 0.0, 1.0));
+    // Detail-gate floor lowered from 0.65 -> 0.20: at detailMask=0 (flat,
+    // low-variation content like a plain sign board) iMMERSE was still
+    // running at 65% strength, reopening the flat-region noise-amplification
+    // problem the RCAS ceiling change above was meant to close.
+    float immerseDetailGate = mix(0.20, 1.0, detailMask);
+    // Base amount lowered from 0.30 -> 0.18: this is a third sharpening
+    // operator stacked after EASU and RCAS with no shared budget between
+    // them, so its own contribution needs to be smaller than it would be
+    // as a standalone effect.
+    float immerseAmount = 0.18 * fxStrength *
+                          immerseEdgeGate * immerseDetailGate;
+    rgb = applyImmerseSimple(rgb, uv, immerseAmount);
+
+    // Lightweight remaster finish: subtle midtone contrast and saturation.
+    // Uses only ALU; no additional texture taps.
+    vec3 remasterBase = rgb;
+    float remasterY = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    // Added a (1.0 - 0.5*detailMask) term: previously this mask was purely
+    // luminance-based, so a saturated, high-detail midtone area (e.g.
+    // graffiti) got the same contrast/saturation bump as a clean flat
+    // midtone surface (skin, walls) -- on top of DLS's +8% saturation,
+    // Natural's chroma boost, and whatever fringing EASU/RCAS/iMMERSE
+    // already left there. Backing off on high-detailMask content keeps the
+    // "remaster glow" on the surfaces it actually helps.
+    float midtoneMask = smoothstep(0.08, 0.28, remasterY) *
+                        (1.0 - smoothstep(0.55, 0.90, remasterY)) *
+                        (1.0 - 0.5 * detailMask);
+
+    float remasterContrast = mix(1.0, 1.035, midtoneMask * fxStrength);
+    rgb = (rgb - 0.5) * remasterContrast + 0.5;
+
+    float remasterSat = mix(1.0, 1.045, midtoneMask * fxStrength);
+    float y = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    rgb = mix(vec3(y), rgb, remasterSat);
+
+    // Protect dark detailed areas from the remaster finish.
+    rgb = mix(remasterBase, rgb, 1.0 - 0.35 * darkDetailProtect);
+
+    // Final conservative luminance/detail guard.
+    //
+    // If the color pipeline has moved a dark detailed pixel substantially,
+    // pull it partway back toward the pre-color-FX value. This is intentionally
+    // a blend rather than an RGB rescale, so hue/saturation are not destabilized.
+    float guard = 0.35 * clamp(darkDetailProtect, 0.0, 1.0);
+    rgb = mix(rgb, beforeColorFX, guard);
+}
 
 void main() {
     highp vec2 step = vec2(pc.invSrcW, pc.invSrcH);
@@ -388,7 +558,9 @@ void main() {
     if (edgeVote <= EDGE_THRESHOLD - EDGE_TAPER_BAND) {
         // Well inside a flat region -- skip the directional resample entirely.
         vec3 rgb = center.rgb;
-        applyPostFX(rgb, fragTexCoord, 0.0);
+        // No neighborhood EASU data exists on this fast path, so use the
+        // center itself as the local mean. This adds no taps.
+        applyPostFX(rgb, fragTexCoord, 0.0, centerG, centerG);
         outColor = vec4(rgb, (pc.useTexAlpha != 0) ? center.a : 1.0);
         return;
     }
@@ -434,7 +606,11 @@ void main() {
     // it host-controlled later: replace SHARP_DEFAULT below with
     // clamp(pc.sharpness, 0.0, 1.0) once vkCmdPushConstants actually writes
     // this field -- nothing else here needs to change.
-    const float SHARP_DEFAULT = 0.5; // 0 = softest, 1 = sharpest of the mix() ranges below
+    // Lowered from 0.5 -> 0.32, same as the non-iMMERSE variant. This is
+    // the root EASU overshoot the RCAS/iMMERSE/remaster changes above don't
+    // touch -- pc.sharpness is still unsafe to read (host never writes it),
+    // so wiring a real slider needs a host-side change outside this file.
+    const float SHARP_DEFAULT = 0.32;
     float sharpAmt = SHARP_DEFAULT;
 
     vec2 footprint = sourceFootprint();
@@ -469,10 +645,14 @@ void main() {
     float maxY = max(max(left.y, left.z), max(right.x, right.w)) + mean;
     float minY = min(min(left.y, left.z), min(right.x, right.w)) + mean;
 
-    float edgeSharpness = mix(1.0, 2.0, sharpAmt);
+    // Capped from 2.0 -> 1.6, same rationale as the non-iMMERSE variant --
+    // with a third sharpener (iMMERSE) now downstream, this term overshooting
+    // matters even more.
+    float edgeSharpness = mix(1.0, 1.6, sharpAmt);
     finalY = clamp(edgeSharpness * finalY + mean, minY, maxY);
 
-    float maxDelta = mix(16.0, 40.0, sharpAmt) / 255.0;
+    // Capped from 40 -> 28, same as the non-iMMERSE variant.
+    float maxDelta = mix(16.0, 28.0, sharpAmt) / 255.0;
     float deltaY   = clamp(finalY - centerG, -maxDelta, maxDelta);
 
     // Taper the correction out near EDGE_THRESHOLD instead of the old hard
@@ -501,7 +681,9 @@ void main() {
     float scaleSharp = 1.0 + clamp((upscale - 1.0) * 0.06, 0.0, 0.10);
     edgeStrength = clamp(edgeStrength / scaleSharp, 0.0, 1.0);
 
-    applyPostFX(result.rgb, fragTexCoord, edgeStrength);
+    // `mean` is already computed from the EASU gather neighborhood, so the
+    // content-aware color guard costs no additional texture reads.
+    applyPostFX(result.rgb, fragTexCoord, edgeStrength, centerG, mean);
 
     outColor = result;
 }

@@ -329,7 +329,11 @@ vec3 applyNatural(vec3 c) {
                        0.95568806, -0.27158179, -1.10817732,
                        0.61985809, -0.64687381,  1.70506455);
     vec3 t = c * toYIQ;
-    t = vec3(pow(t.r, 1.12), t.g * 1.2, t.b * 1.2);
+    // Chroma multiplier lowered from 1.2 -> 1.10. applyDLS already adds
+    // +8% saturation before this runs; stacking a second +20% boost on top
+    // was exaggerating the color fringing left by EASU/RCAS on saturated
+    // edges (turns a subtle ring into a visible colored halo).
+    t = vec3(pow(t.r, 1.12), t.g * 1.10, t.b * 1.10);
     return clamp(t * toRGB, 0.0, 1.0);
 }
 
@@ -381,8 +385,24 @@ void applyPostFX(inout vec3 rgb,
 
     // 1. RCAS: keep it active, but reduce it slightly in already-reconstructed
     // edges. This is the same zero-extra-tap RCAS path as before.
-    float casSharp = mix(1.0, 0.3, clamp(edgeStrength, 0.0, 1.0));
+    // Ceiling lowered from 1.0 -> 0.75: RCAS sharpens flat regions harder
+    // than edges by design, which is correct when the flatness hides real
+    // detail but amplifies texture/JPEG micro-noise when it doesn't (e.g.
+    // a flat, mid-bright sign board). 0.75 still sharpens genuine flat
+    // detail, just not at full strength.
+    float casSharp = mix(0.75, 0.3, clamp(edgeStrength, 0.0, 1.0));
     casSharp = mix(0.55, casSharp, fxStrength);
+
+    // Additional guard: darkDetailProtect above only covers dark regions
+    // (shadowMask gates on centerLuma < ~0.30), so a flat, NON-dark, noisy
+    // surface gets none of that protection. flatMask below is high when
+    // localVariation is low (same signal detailMask already uses, just
+    // inverted) and is only applied where shadowMask is low, so it never
+    // fights the existing dark-detail guard -- it just closes the gap for
+    // flat midtone/bright surfaces.
+    float flatMask = 1.0 - detailMask;
+    casSharp = mix(casSharp, casSharp * 0.6, flatMask * (1.0 - shadowMask));
+
     rgb = applyRCAS(rgb, uv, casSharp);
 
     // Preserve the pre-color-processing result for a final shadow/detail
@@ -496,7 +516,15 @@ void main() {
     // it host-controlled later: replace SHARP_DEFAULT below with
     // clamp(pc.sharpness, 0.0, 1.0) once vkCmdPushConstants actually writes
     // this field -- nothing else here needs to change.
-    const float SHARP_DEFAULT = 0.5; // 0 = softest, 1 = sharpest of the mix() ranges below
+    // Lowered from 0.5 -> 0.32. pc.sharpness is still unsafe to read here --
+    // host-side code never calls vkCmdPushConstants for this field, so
+    // reading it would pull uninitialized data. Actually wiring a
+    // user-facing slider requires a host-side (C++) change outside this
+    // file; until that lands, 0.32 trims EASU's edge-delta overshoot
+    // (see edgeSharpness/maxDelta below) that was producing halo/ringing
+    // on hard, saturated edges, while keeping most of the reconstruction
+    // sharpness EASU is there for.
+    const float SHARP_DEFAULT = 0.32;
     float sharpAmt = SHARP_DEFAULT;
 
     vec2 footprint = sourceFootprint();
@@ -531,10 +559,16 @@ void main() {
     float maxY = max(max(left.y, left.z), max(right.x, right.w)) + mean;
     float minY = min(min(left.y, left.z), min(right.x, right.w)) + mean;
 
-    float edgeSharpness = mix(1.0, 2.0, sharpAmt);
+    // Capped from 2.0 -> 1.6. At 2.0x this term was overshooting hard,
+    // saturated color edges (graffiti-on-concrete style content) and
+    // producing a visible halo before RCAS even runs. 1.6 keeps most of
+    // the perceived crispness on linework/text with less ringing headroom.
+    float edgeSharpness = mix(1.0, 1.6, sharpAmt);
     finalY = clamp(edgeSharpness * finalY + mean, minY, maxY);
 
-    float maxDelta = mix(16.0, 40.0, sharpAmt) / 255.0;
+    // Capped from 40 -> 28. Limits the max luminance correction per pixel,
+    // directly trimming halo intensity on the same hard-edge case above.
+    float maxDelta = mix(16.0, 28.0, sharpAmt) / 255.0;
     float deltaY   = clamp(finalY - centerG, -maxDelta, maxDelta);
 
     // Taper the correction out near EDGE_THRESHOLD instead of the old hard
