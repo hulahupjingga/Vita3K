@@ -36,6 +36,10 @@ static int get_threshold_samples(const int device_buffer_samples) {
     return 4 * device_buffer_samples;
 }
 
+// Mirrors SceAudioOutPortType::SCE_AUDIO_OUT_PORT_TYPE_BGM (see modules/SceAudio.cpp) without
+// this module depending on the SceAudio module's enum.
+constexpr int PORT_TYPE_BGM = 1;
+
 void SDLCALL SDLAudioAdapter::thread_wakeup_callback(void *userdata, SDL_AudioStream *stream, int additional_amount, int total_amount) {
     assert(userdata != nullptr);
     assert(stream != nullptr);
@@ -50,9 +54,10 @@ SDLAudioAdapter::SDLAudioAdapter(AudioState &audio_state)
     : AudioAdapter(audio_state) {}
 
 SDLAudioAdapter::~SDLAudioAdapter() {
-    if (device_id > 0) {
-        SDL_CloseAudioDevice(device_id);
-    }
+    if (device_id_fast > 0)
+        SDL_CloseAudioDevice(device_id_fast);
+    if (device_id_normal > 0)
+        SDL_CloseAudioDevice(device_id_normal);
 }
 
 bool SDLAudioAdapter::init() {
@@ -60,28 +65,49 @@ bool SDLAudioAdapter::init() {
     // Request smaller device buffer for lower latency callbacks.
     // 512 sample frames = 2048 bytes for stereo 16-bit, matching cubeb's callback size.
     SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "512");
-    device_id = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, nullptr);
-    SDL_CHECK_EXT(device_id > 0, false);
+    device_id_fast = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, nullptr);
+    SDL_CHECK_EXT(device_id_fast > 0, false);
+
+    // Open a second device without the low-latency hint, so it isn't pushed onto a fast/MMAP
+    // path that bypasses platform-level audio effects. Used for BGM-type ports (see
+    // device_for_port_type below).
+    SDL_ResetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES);
+    device_id_normal = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, nullptr);
+    SDL_CHECK_EXT(device_id_normal > 0, false);
+
+    // restore the low-latency hint so it's the active one for anything opened afterward without
+    // going through device_for_port_type() (shouldn't happen, but keeps behavior predictable)
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "512");
+
     return true;
 }
 
-void SDLAudioAdapter::switch_state(const bool pause) {
-    if (pause)
-        SDL_CHECK_VOID(SDL_PauseAudioDevice(device_id));
-    else
-        SDL_CHECK_VOID(SDL_ResumeAudioDevice(device_id));
+SDL_AudioDeviceID SDLAudioAdapter::device_for_port_type(int port_type) const {
+    return port_type == PORT_TYPE_BGM ? device_id_normal : device_id_fast;
 }
 
-AudioOutPortPtr SDLAudioAdapter::open_port(int nb_channels, int freq, int nb_sample) {
+void SDLAudioAdapter::switch_state(const bool pause) {
+    if (pause) {
+        SDL_CHECK_VOID(SDL_PauseAudioDevice(device_id_fast));
+        SDL_CHECK_VOID(SDL_PauseAudioDevice(device_id_normal));
+    } else {
+        SDL_CHECK_VOID(SDL_ResumeAudioDevice(device_id_fast));
+        SDL_CHECK_VOID(SDL_ResumeAudioDevice(device_id_normal));
+    }
+}
+
+AudioOutPortPtr SDLAudioAdapter::open_port(int nb_channels, int freq, int nb_sample, int port_type) {
+    const SDL_AudioDeviceID device = device_for_port_type(port_type);
+
     SDL_AudioSpec src_spec = {
         .format = SDL_AUDIO_S16LE,
         .channels = nb_channels,
         .freq = freq
     };
-    SDL_CHECK(SDL_GetAudioDeviceFormat(device_id, &dst_spec, &device_buffer_samples));
+    SDL_CHECK(SDL_GetAudioDeviceFormat(device, &dst_spec, &device_buffer_samples));
     const AudioStreamPtr stream(SDL_CreateAudioStream(&src_spec, &dst_spec), SDL_DestroyAudioStream);
     SDL_CHECK(stream);
-    SDL_CHECK(SDL_BindAudioStream(device_id, stream.get()));
+    SDL_CHECK(SDL_BindAudioStream(device, stream.get()));
     auto port = std::make_shared<SDLAudioOutPort>(stream, *this);
     SDL_CHECK(SDL_SetAudioStreamGetCallback(stream.get(), SDLAudioAdapter::thread_wakeup_callback, port.get()));
     port->channels = nb_channels;
