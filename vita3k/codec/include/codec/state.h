@@ -265,6 +265,14 @@ struct PlayerState {
     uint32_t last_sample_rate = 0;
     uint32_t last_sample_count = 0;
 
+    // Resampler used by receive_audio() to convert whatever format/rate the movie's audio
+    // stream decodes to into S16 for the audio backends. Rebuilt if that format changes
+    // (e.g. switching to a differently-encoded video mid-queue).
+    SwrContext *swr_ctx = nullptr;
+    int swr_in_format = -1;
+    int swr_in_rate = 0;
+    int swr_in_channels = 0;
+
     DecoderSize get_size();
     uint64_t get_framerate_microseconds();
 
