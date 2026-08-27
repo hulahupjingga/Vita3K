@@ -75,7 +75,13 @@ public:
     virtual ~AudioAdapter() = default;
 
     virtual bool init() = 0;
-    virtual AudioOutPortPtr open_port(int nb_channels, int freq, int nb_sample) { return nullptr; }
+    // port_type mirrors SceAudioOutPortType (0 = MAIN, 1 = BGM, 2 = VOICE) but is passed as a
+    // plain int since this module doesn't depend on the SceAudio module's enum. Backends can use
+    // it to route non-interactive audio (BGM, e.g. movie/cutscene audio) differently from
+    // latency-sensitive audio (MAIN/VOICE) -- for instance to land on a platform audio path that
+    // picks up OS-level effects (equalizer, DTS/Dolby-style processing) instead of a low-latency
+    // path that bypasses them.
+    virtual AudioOutPortPtr open_port(int nb_channels, int freq, int nb_sample, int port_type = 0) { return nullptr; }
     virtual void audio_output(AudioOutPort &out_port, const void *buffer) {}
     virtual void set_volume(AudioOutPort &out_port, float volume) {}
     virtual void switch_state(const bool pause) {}
@@ -98,7 +104,7 @@ struct AudioState {
     void deinit();
     void stop_all_ports();
     void set_backend(const std::string &adapter_name);
-    AudioOutPortPtr open_port(int nb_channels, int freq, int nb_sample);
+    AudioOutPortPtr open_port(int nb_channels, int freq, int nb_sample, int port_type = 0);
     void audio_output(AudioOutPort &out_port, const void *buffer);
     void set_volume(AudioOutPort &out_port, float volume);
     void set_global_volume(float volume);
