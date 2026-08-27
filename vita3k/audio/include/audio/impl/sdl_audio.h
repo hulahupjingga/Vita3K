@@ -23,20 +23,17 @@
 
 class SDLAudioAdapter : public AudioAdapter {
 private:
-    // low-latency device: used for MAIN/VOICE ports, where the game needs tight audio timing
-    // for interactive sound effects/gameplay audio.
-    SDL_AudioDeviceID device_id_fast = 0;
-    // normal-latency device: used for BGM ports (e.g. movie/cutscene audio via SceAvPlayer),
-    // which don't need tight timing. Opened without the low-latency hint so it stays off the
-    // MMAP fast path on platforms like Android, keeping it on the regular mixer output that
-    // OS-level audio effects (equalizer, DTS/Dolby-style processing) are attached to.
-    SDL_AudioDeviceID device_id_normal = 0;
+    // Every port (MAIN/VOICE/BGM alike) shares this single device, opened without
+    // AAUDIO_PERFORMANCE_MODE_LOW_LATENCY so all audio -- including gameplay sound effects --
+    // stays on Android's normal mixer thread, where OS-level effects (equalizer, DTS/Dolby-style
+    // processing) are applied. Trade-off: gameplay audio latency goes from AAudio's fast/MMAP
+    // path (~2-3ms mixer period) to the normal mixer thread (~20ms period), which can be
+    // noticeable in latency-sensitive games (rhythm games, fighting games, etc).
+    SDL_AudioDeviceID device_id = 0;
     int device_buffer_samples = 0;
     SDL_AudioSpec dst_spec;
 
     static void SDLCALL thread_wakeup_callback(void *userdata, SDL_AudioStream *stream, int additional_amount, int total_amount);
-
-    SDL_AudioDeviceID device_for_port_type(int port_type) const;
 
 public:
     explicit SDLAudioAdapter(AudioState &audio_state);
