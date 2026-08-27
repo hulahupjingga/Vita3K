@@ -23,6 +23,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
+#include <libswresample/swresample.h>
 }
 
 #include <cassert>
@@ -50,6 +51,9 @@ void PlayerState::free_video() {
 
     if (audio_context)
         avcodec_free_context(&audio_context);
+
+    if (swr_ctx)
+        swr_free(&swr_ctx);
 
     if (format)
         avformat_close_input(&format);
@@ -163,23 +167,48 @@ std::vector<int16_t> PlayerState::receive_audio() {
             }
         }
 
-        LOG_WARN_IF(frame->format != AV_SAMPLE_FMT_FLTP, "Unknown audio format {}.", frame->format);
-
         last_channels = frame->ch_layout.nb_channels;
         last_sample_count = frame->nb_samples;
         last_sample_rate = frame->sample_rate;
 
-        data.resize(frame->nb_samples * frame->ch_layout.nb_channels);
+        // (Re)create the resampler/converter if the input format has changed since last time
+        // (e.g. on the very first frame, or if a subsequent video in the queue decodes differently).
+        // This also gives us correct handling of any AVSampleFormat the decoder hands us instead of
+        // silently misreading the buffer as FLTP, plus proper clipping/dithering on the float -> S16
+        // conversion instead of a raw truncating cast.
+        if (!swr_ctx || frame->format != swr_in_format || frame->sample_rate != swr_in_rate
+            || frame->ch_layout.nb_channels != swr_in_channels) {
+            if (swr_ctx)
+                swr_free(&swr_ctx);
 
-        for (int a = 0; a < frame->nb_samples; a++) {
-            for (int b = 0; b < frame->ch_layout.nb_channels; b++) {
-                auto *frame_data = reinterpret_cast<float *>(frame->data[b]);
-                float current_sample = frame_data[a];
-                int16_t pcm_sample = current_sample * INT16_MAX;
+            AVChannelLayout out_ch_layout;
+            av_channel_layout_default(&out_ch_layout, frame->ch_layout.nb_channels);
 
-                data[a * frame->ch_layout.nb_channels + b] = pcm_sample;
-            }
+            int err = swr_alloc_set_opts2(&swr_ctx,
+                &out_ch_layout, AV_SAMPLE_FMT_S16, frame->sample_rate,
+                &frame->ch_layout, static_cast<AVSampleFormat>(frame->format), frame->sample_rate,
+                0, nullptr);
+            av_channel_layout_uninit(&out_ch_layout);
+            assert(err == 0 && swr_ctx != nullptr);
+
+            // Use triangular dithering when narrowing from float to 16-bit so the extra
+            // precision gets turned into noise-shaped dither instead of being truncated away.
+            av_opt_set_int(swr_ctx, "dither_method", SWR_DITHER_TRIANGULAR, 0);
+
+            err = swr_init(swr_ctx);
+            assert(err == 0);
+
+            swr_in_format = frame->format;
+            swr_in_rate = frame->sample_rate;
+            swr_in_channels = frame->ch_layout.nb_channels;
         }
+
+        data.resize(frame->nb_samples * frame->ch_layout.nb_channels);
+        uint8_t *out_planes[1] = { reinterpret_cast<uint8_t *>(data.data()) };
+        int converted = swr_convert(swr_ctx, out_planes, frame->nb_samples,
+            const_cast<const uint8_t **>(frame->data), frame->nb_samples);
+        assert(converted >= 0);
+        data.resize(converted * frame->ch_layout.nb_channels);
 
         break;
     }
