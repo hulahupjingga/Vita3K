@@ -171,7 +171,7 @@ EXPORT(int, sceAudioOutOpenPort, SceAudioOutPortType type, int len, int freq, Sc
 
     const int channels = (mode == SCE_AUDIO_OUT_MODE_MONO) ? 1 : 2;
 
-    AudioOutPortPtr port = emuenv.audio.open_port(channels, freq, len);
+    AudioOutPortPtr port = emuenv.audio.open_port(channels, freq, len, static_cast<int>(type));
     if (!port)
         return RET_ERROR(SCE_AUDIO_OUT_ERROR_NOT_OPENED);
 
@@ -294,7 +294,7 @@ EXPORT(int, sceAudioOutSetConfig, int port, int len, int freq, int mode) {
 
     const auto channels = (set_mode == SCE_AUDIO_OUT_MODE_MONO) ? 1 : 2;
 
-    prt = emuenv.audio.open_port(channels, set_freq, set_len);
+    prt = emuenv.audio.open_port(channels, set_freq, set_len, prt->type);
     if (!prt)
         return RET_ERROR(SCE_AUDIO_OUT_ERROR_NOT_OPENED);
 
