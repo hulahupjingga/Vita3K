@@ -85,8 +85,8 @@ void AudioState::set_backend(const std::string &adapter_name) {
     }
 }
 
-AudioOutPortPtr AudioState::open_port(int nb_channels, int freq, int nb_sample) {
-    AudioOutPortPtr port = adapter->open_port(nb_channels, freq, nb_sample);
+AudioOutPortPtr AudioState::open_port(int nb_channels, int freq, int nb_sample, int port_type) {
+    AudioOutPortPtr port = adapter->open_port(nb_channels, freq, nb_sample, port_type);
     set_volume(*port, port->volume);
     return port;
 }
