@@ -107,7 +107,12 @@ bool CubebAudioAdapter::init() {
     return true;
 }
 
-AudioOutPortPtr CubebAudioAdapter::open_port(int nb_channels, int freq, int nb_sample) {
+AudioOutPortPtr CubebAudioAdapter::open_port(int nb_channels, int freq, int nb_sample, int port_type) {
+    // The Android MMAP-fast-path/DTS-routing issue that port_type exists to work around is
+    // SDL/Android-specific (see SDLAudioAdapter::device_for_port_type) -- cubeb isn't used
+    // there, so port_type is intentionally unused here; every port goes through the same setup.
+    (void)port_type;
+
     std::shared_ptr<CubebAudioOutPort> port = std::make_shared<CubebAudioOutPort>();
     port->spec = {
         // all the ps vita samples are signed 16 bits low edian
