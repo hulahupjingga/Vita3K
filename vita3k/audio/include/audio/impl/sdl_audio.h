@@ -29,6 +29,9 @@ private:
     // processing) are applied. Trade-off: gameplay audio latency goes from AAudio's fast/MMAP
     // path (~2-3ms mixer period) to the normal mixer thread (~20ms period), which can be
     // noticeable in latency-sensitive games (rhythm games, fighting games, etc).
+    // Queue depth and wakeup timing are tuned in sdl_audio.cpp (kQueueThresholdMultiplier,
+    // the device buffer size hint, and the feeder wait_for timeout) to keep added latency on
+    // top of that ~20ms floor as small as possible without introducing underrun crackle.
     SDL_AudioDeviceID device_id = 0;
     int device_buffer_samples = 0;
     SDL_AudioSpec dst_spec;
