@@ -19,6 +19,13 @@
 #include "util/log.h"
 #include <SDL3/SDL_audio.h>
 #include <SDL3/SDL_hints.h>
+#include <cstdlib>
+#include <string>
+
+#ifdef __ANDROID__
+#include <SDL3/SDL_system.h>
+#include <jni.h>
+#endif
 
 #define SDL_CHECK_EXT(condition, ret)                         \
     do {                                                      \
@@ -32,9 +39,55 @@
 #define SDL_CHECK_VOID(f_call) SDL_CHECK_EXT(f_call, )
 #define SDL_CHECK_NEG(f_call) SDL_CHECK_EXT((f_call) >= 0, {})
 
+// How many device-buffer-periods of audio we let queue up in the stream before the
+// feeder thread refills. This is pure added latency on top of the mixer's own period,
+// so it's kept as tight as possible. 2x is a starting point for the normal (non-low-latency)
+// path -- if you see underrun crackle on lower-end devices, raise it in small steps (2.5, 3)
+// rather than jumping back to 4.
+static constexpr int kQueueThresholdMultiplier = 2;
+
 static int get_threshold_samples(const int device_buffer_samples) {
-    return 4 * device_buffer_samples;
+    return kQueueThresholdMultiplier * device_buffer_samples;
 }
+
+#ifdef __ANDROID__
+// Ask Android for its reported optimal output buffer size (AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER)
+// so we can hint SDL/AAudio to use that instead of whatever conservative default the OEM's
+// normal-mixer path would otherwise pick. Falls back to 0 (== "let SDL decide") on any failure.
+static int get_android_optimal_frames_per_buffer() {
+    JNIEnv *env = static_cast<JNIEnv *>(SDL_GetAndroidJNIEnv());
+    jobject activity = static_cast<jobject>(SDL_GetAndroidActivity());
+    if (!env || !activity)
+        return 0;
+
+    jclass activity_class = env->GetObjectClass(activity);
+    jmethodID get_system_service = env->GetMethodID(activity_class, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
+    jclass context_class = env->FindClass("android/content/Context");
+    jfieldID audio_service_field = env->GetStaticFieldID(context_class, "AUDIO_SERVICE", "Ljava/lang/String;");
+    jstring audio_service = static_cast<jstring>(env->GetStaticObjectField(context_class, audio_service_field));
+    jobject audio_manager = env->CallObjectMethod(activity, get_system_service, audio_service);
+    if (!audio_manager || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return 0;
+    }
+
+    jclass audio_manager_class = env->GetObjectClass(audio_manager);
+    jmethodID get_property = env->GetMethodID(audio_manager_class, "getProperty", "(Ljava/lang/String;)Ljava/lang/String;");
+    jfieldID prop_field = env->GetStaticFieldID(audio_manager_class, "PROPERTY_OUTPUT_FRAMES_PER_BUFFER", "Ljava/lang/String;");
+    jstring prop_name = static_cast<jstring>(env->GetStaticObjectField(audio_manager_class, prop_field));
+    jstring result = static_cast<jstring>(env->CallObjectMethod(audio_manager, get_property, prop_name));
+    if (!result || env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return 0;
+    }
+
+    const char *chars = env->GetStringUTFChars(result, nullptr);
+    const int frames = chars ? std::atoi(chars) : 0;
+    if (chars)
+        env->ReleaseStringUTFChars(result, chars);
+    return frames;
+}
+#endif
 
 void SDLCALL SDLAudioAdapter::thread_wakeup_callback(void *userdata, SDL_AudioStream *stream, int additional_amount, int total_amount) {
     assert(userdata != nullptr);
@@ -63,6 +116,18 @@ bool SDLAudioAdapter::init() {
     // (~2-3ms mixer period) to the normal mixer thread's (~20ms), which can be noticeable in
     // latency-sensitive games.
     SDL_SetHint(SDL_HINT_ANDROID_LOW_LATENCY_AUDIO, "0");
+
+#ifdef __ANDROID__
+    // Even on the normal mixer path, some OEMs default to a larger buffer than the device
+    // actually needs. Hint SDL to the device's own reported optimal frame count instead of
+    // leaving it to whatever conservative default AAudio picks for non-low-latency streams.
+    const int optimal_frames = get_android_optimal_frames_per_buffer();
+    if (optimal_frames > 0) {
+        SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, std::to_string(optimal_frames).c_str());
+        LOG_INFO("SDL audio: requesting Android-reported optimal buffer size of {} frames", optimal_frames);
+    }
+#endif
+
     device_id = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, nullptr);
     SDL_CHECK_EXT(device_id > 0, false);
     return true;
@@ -108,7 +173,10 @@ void SDLAudioAdapter::audio_output(AudioOutPort &out_port, const void *buffer) {
     const int samples_available = get_rest_sample(port);
     if (samples_available > get_threshold_samples(device_buffer_samples)) {
         std::unique_lock<std::mutex> lock(port.mutex);
-        port.cond_var.wait_for(lock, std::chrono::microseconds(port.len_microseconds * 2));
+        // Was len_microseconds * 2. A tighter sleep cap means the feeder catches the
+        // threshold crossing sooner instead of oversleeping past it, which is what lets
+        // the queue threshold above stay low without risking underrun on wakeup jitter.
+        port.cond_var.wait_for(lock, std::chrono::microseconds(port.len_microseconds));
         if (out_port.stopping)
             return;
     }
