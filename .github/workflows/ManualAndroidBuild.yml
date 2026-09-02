@@ -1,0 +1,110 @@
+name: Build CI
+
+on:
+  workflow_dispatch:
+
+env:
+  BUILD_CONFIG: Release
+
+jobs:
+  android-build:
+    name: Android
+    runs-on: ubuntu-latest
+    env:
+      # vcpkg only honours VCPKG_DEFAULT_BINARY_CACHE. The old VCPKG_BINARY_CACHE
+      # name was silently ignored, so vcpkg kept using ~/.cache/vcpkg/archives and
+      # rebuilt all 64 ports from source on every run.
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/.vcpkg-binary-cache
+      VCPKG_ROOT: /usr/local/share/vcpkg
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Only `git rev-parse --short HEAD` is needed, which works at depth 1.
+          # fetch-depth propagates to submodules, which are the real cost here.
+          fetch-depth: 1
+          submodules: recursive
+
+      # vcpkg refuses to use a binary cache directory that does not exist, and the
+      # cache restore below is a no-op on a cold cache. Create it up front.
+      - name: Create vcpkg binary cache directory
+        run: mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          # v2 escapes the poisoned 206-byte entry saved under the v1 key. Because
+          # that entry hit the primary key, actions/cache never re-saved it and the
+          # cache could not self-heal. restore-keys must be bumped too, or the
+          # fallback prefix would pull the empty entry straight back in.
+          #
+          # Key inputs are deliberately narrow. The contents of a vcpkg binary
+          # cache depend only on the manifest (+ builtin-baseline) and the
+          # triplet/toolchain definition. The old key also hashed CMakeLists.txt,
+          # all of cmake/** and all of .ci/**, so editing an unrelated CI script
+          # threw away a perfectly valid 6-minute cache.
+          key: vcpkg-bincache-android-v2-${{ hashFiles('vcpkg.json', 'cmake/vcpkg_android.cmake') }}
+          restore-keys: |
+            vcpkg-bincache-android-v2-
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          add-job-summary: on-failure
+          cache-provider: basic
+          validate-wrappers: false
+
+      - name: Set up Android SDK tools
+        uses: android-actions/setup-android@v4
+
+      - name: Set up Android build environment
+        run: bash ./.ci/setup-android.sh
+
+      - uses: hendrikmuhs/ccache-action@v1.2.23
+        with:
+          # 500 MB default caused 54 evictions in a single build; it was evicting
+          # objects it still needed. Key is deliberately not rotated so the warm
+          # arm64 objects survive; stale x86_64 objects age out via LRU.
+          max-size: 2G
+
+      - name: Decode Android keystore
+        env:
+          KEYSTORE_ENCODED: ${{ secrets.KEYSTORE }}
+        run: |
+          if [ -n "$KEYSTORE_ENCODED" ]; then
+            echo "$KEYSTORE_ENCODED" | base64 --decode > /home/runner/keystore.jks
+          fi
+
+      - name: Compute artifact paths
+        shell: bash
+        run: |
+          short_sha="$(git rev-parse --short HEAD)"
+          echo "GIT_SHORT_SHA=${short_sha}" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=vita3k-${short_sha}-android" >> "$GITHUB_ENV"
+          echo "ARTIFACT_DIR=artifacts/vita3k-${short_sha}-android" >> "$GITHUB_ENV"
+
+      - name: Build Android target
+        env:
+          SIGNING_STORE_PATH: /home/runner/keystore.jks
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: bash ./.ci/build-android.sh "${{ env.ARTIFACT_DIR }}"
+
+      - name: Print Android ccache statistics
+        run: ccache -s
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_DIR }}/*.apk
+          if-no-files-found: error
