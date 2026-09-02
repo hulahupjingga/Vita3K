@@ -49,6 +49,7 @@
 #include <SDL3/SDL_system.h>
 #include <dlfcn.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #include <util/float_to_half.h>
 
 #ifdef USE_ADRENO_TOOLS
@@ -622,6 +623,7 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
         bool support_buffer_device_address = false;
         bool support_external_memory = false;
         bool support_shader_interlock = false;
+        bool support_dma_buf = false;
         const std::map<std::string_view, bool *> optional_extensions = {
             { vk::KHRGetMemoryRequirements2ExtensionName, &temp_bool },
             // can be used by vma to improve performance
@@ -656,6 +658,8 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
             // used for memory trapping in android
             { VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME, &support_android_buffer_import },
             { VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, &support_unix_fd_import },
+            // required to import the dma-buf fd fallback with the correct (non-opaque) handle type
+            { VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, &support_dma_buf },
 #endif
         };
 
@@ -688,7 +692,7 @@ bool VKState::create(std::unique_ptr<renderer::State> &state, const Config &conf
 
 #ifdef __ANDROID__
         support_android_buffer_import &= SDL_GetAndroidSDKVersion() >= 26;
-        support_unix_fd_import &= SDL_GetAndroidSDKVersion() >= 26;
+        support_unix_fd_import &= SDL_GetAndroidSDKVersion() >= 26 && support_dma_buf;
 #endif
 
         // Find which memory mapping methods are supported by the GPU
@@ -1025,8 +1029,7 @@ void VKState::cleanup() {
             if (mapping_method == MappingMethod::NativeBuffer && ext->extra) {
                 AHardwareBuffer *hardware_buffer = reinterpret_cast<AHardwareBuffer *>(ext->extra);
                 _AHardwareBuffer_unlock(hardware_buffer, nullptr);
-                if (support_android_buffer_import)
-                    _AHardwareBuffer_release(hardware_buffer);
+                _AHardwareBuffer_release(hardware_buffer);
             }
 #endif
         }
@@ -1338,9 +1341,15 @@ bool VKState::map_memory(MemState &mem, Ptr<void> address, uint32_t size) {
             const vk::AndroidHardwareBufferPropertiesANDROID hardware_props = device.getAndroidHardwareBufferPropertiesANDROID(*buffer);
 
             uint32_t mapped_memory_type = find_suitable_mapped_type(hardware_props.memoryTypeBits);
+            // Per the VK_ANDROID_external_memory_android_hardware_buffer spec, allocationSize must be set to
+            // the value reported by vkGetAndroidHardwareBufferPropertiesANDROID, not an arbitrary size. Using
+            // size + KiB(4) here violates VUID-VkMemoryAllocateInfo-allocationSize-02383 and, while some
+            // Adreno blob drivers silently accept the mismatch, ARM's Mali driver (as used on the Dimensity
+            // 8050's Mali-G610 MC6) validates this strictly and can fail the allocation or return unmapped
+            // garbage/zero-length memory, which shows up as corrupt or flickering surfaces.
             vk::StructureChain<vk::MemoryAllocateInfo, vk::ImportAndroidHardwareBufferInfoANDROID, vk::MemoryAllocateFlagsInfo> alloc_info{
                 vk::MemoryAllocateInfo{
-                    .allocationSize = size + KiB(4),
+                    .allocationSize = hardware_props.allocationSize,
                     .memoryTypeIndex = mapped_memory_type },
                 vk::ImportAndroidHardwareBufferInfoANDROID{
                     .buffer = buffer },
@@ -1355,20 +1364,36 @@ bool VKState::map_memory(MemState &mem, Ptr<void> address, uint32_t size) {
                 return false;
             }
 
-            int fd = handle->data[0];
-            const vk::MemoryFdPropertiesKHR fd_props = device.getMemoryFdPropertiesKHR(vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd, fd);
+            // vkGetMemoryFdPropertiesKHR explicitly disallows eOpaqueFd (it means "an fd previously
+            // exported by this Vulkan implementation"), and this fd is a foreign dma-buf handle owned
+            // by gralloc, so eDmaBufEXT (VK_EXT_external_memory_dma_buf) is the correct type here.
+            // Importing a fd also transfers ownership to the driver, which will close() it on
+            // vkFreeMemory -- but this fd still belongs to the live AHardwareBuffer, so we must
+            // dup() it rather than hand over the AHB's own descriptor.
+            const int fd = dup(handle->data[0]);
+            if (fd == -1) {
+                LOG_ERROR("Failed to dup Android hardware buffer fd");
+                return false;
+            }
+            const vk::MemoryFdPropertiesKHR fd_props = device.getMemoryFdPropertiesKHR(vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT, fd);
             uint32_t mapped_memory_type = find_suitable_mapped_type(fd_props.memoryTypeBits);
             vk::StructureChain<vk::MemoryAllocateInfo, vk::ImportMemoryFdInfoKHR, vk::MemoryAllocateFlagsInfo> alloc_info{
                 vk::MemoryAllocateInfo{
                     .allocationSize = size + KiB(4),
                     .memoryTypeIndex = mapped_memory_type },
                 vk::ImportMemoryFdInfoKHR{
-                    .handleType = vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd,
+                    .handleType = vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT,
                     .fd = fd },
                 vk::MemoryAllocateFlagsInfo{
                     .flags = vk::MemoryAllocateFlagBits::eDeviceAddress }
             };
-            device_memory = device.allocateMemory(alloc_info.get());
+            try {
+                device_memory = device.allocateMemory(alloc_info.get());
+            } catch (...) {
+                // allocateMemory takes ownership of fd only on success; on failure we still own it
+                close(fd);
+                throw;
+            }
         }
 
         vk::StructureChain<vk::BufferCreateInfo, vk::ExternalMemoryBufferCreateInfoKHR> buffer_info{
@@ -1377,10 +1402,11 @@ bool VKState::map_memory(MemState &mem, Ptr<void> address, uint32_t size) {
                 .usage = mapped_memory_flags,
                 .sharingMode = vk::SharingMode::eExclusive },
             vk::ExternalMemoryBufferCreateInfoKHR{
-                .handleTypes = support_android_buffer_import ? vk::ExternalMemoryHandleTypeFlagBits::eAndroidHardwareBufferANDROID : vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd }
+                .handleTypes = support_android_buffer_import ? vk::ExternalMemoryHandleTypeFlagBits::eAndroidHardwareBufferANDROID : vk::ExternalMemoryHandleTypeFlagBits::eDmaBufEXT }
         };
         const vk::Buffer mapped_buffer = device.createBuffer(buffer_info.get());
         device.bindBufferMemory(mapped_buffer, device_memory, 0);
+
 
         vk::BufferDeviceAddressInfoKHR address_info{
             .buffer = mapped_buffer
@@ -1399,7 +1425,10 @@ bool VKState::map_memory(MemState &mem, Ptr<void> address, uint32_t size) {
         // also make sure later the mapped address is 4K aligned
         vkutil::Buffer buffer(size + KiB(4));
         constexpr vma::AllocationCreateInfo memory_mapped_alloc = {
-            .flags = vma::AllocationCreateFlagBits::eMapped | vma::AllocationCreateFlagBits::eHostAccessSequentialWrite,
+            // this memory is read AND written by the guest CPU in whatever order the game accesses
+            // it, so it needs VMA's "random access" hint, not "sequential write" (a write-only
+            // staging-buffer pattern that explicitly permits uncached/write-combined memory back).
+            .flags = vma::AllocationCreateFlagBits::eMapped | vma::AllocationCreateFlagBits::eHostAccessRandom,
             .usage = vma::MemoryUsage::eAutoPreferHost,
             .requiredFlags = vk::MemoryPropertyFlagBits::eHostCoherent,
             .preferredFlags = vk::MemoryPropertyFlagBits::eHostCached,
@@ -1485,7 +1514,16 @@ bool VKState::map_memory(MemState &mem, Ptr<void> address, uint32_t size) {
 
     case MappingMethod::DoubleBuffer: {
         vkutil::Buffer buffer(size + KiB(4));
-        buffer.init_buffer(mapped_memory_flags, vkutil::vma_mapped_alloc);
+        // like the PageTable case above, this buffer is read back by the CPU (buffer trapping
+        // copies out of mapped_data), so it needs the random-access hint rather than the
+        // write-only "sequential write" one that vkutil::vma_mapped_alloc uses for staging buffers.
+        constexpr vma::AllocationCreateInfo double_buffer_alloc = {
+            .flags = vma::AllocationCreateFlagBits::eMapped | vma::AllocationCreateFlagBits::eHostAccessRandom,
+            .usage = vma::MemoryUsage::eAuto,
+            .requiredFlags = vk::MemoryPropertyFlagBits::eHostCoherent,
+            .preferredFlags = vk::MemoryPropertyFlagBits::eHostCached,
+        };
+        buffer.init_buffer(mapped_memory_flags, double_buffer_alloc);
 
         vk::BufferDeviceAddressInfoKHR address_info{
             .buffer = buffer.buffer
@@ -1523,7 +1561,9 @@ void VKState::unmap_memory(MemState &mem, Ptr<void> address) {
         break;
 
     case MappingMethod::DoubleBuffer:
-        remove_external_mapping(mem, address.cast<uint8_t>().get(mem), ite->second.size);
+        // note: unlike PageTable/NativeBuffer/ExternalHost, DoubleBuffer never calls
+        // add_external_mapping in map_memory (the guest keeps its normal RAM allocation and only
+        // the device-side copy lives in this buffer), so there is nothing to unregister here.
         // remove all the trapping related to these locations
         buffer_trapping.remove_range(address.address(), address.address() + ite->second.size);
         break;
@@ -1537,9 +1577,9 @@ void VKState::unmap_memory(MemState &mem, Ptr<void> address) {
 
         AHardwareBuffer *hardware_buffer = reinterpret_cast<AHardwareBuffer *>(buffer.extra);
         _AHardwareBuffer_unlock(hardware_buffer, nullptr);
-        // When using external fd, it takes ownership of the handle, so don't release it in this case
-        if (support_android_buffer_import)
-            _AHardwareBuffer_release(hardware_buffer);
+        // We always hold our own reference to this AHB (the fd-import path dups the descriptor
+        // instead of handing over the AHB's own fd), so we must always release it here.
+        _AHardwareBuffer_release(hardware_buffer);
         break;
     }
 #endif
@@ -1614,6 +1654,7 @@ static int get_supported_mapping_methods_mask(const vk::PhysicalDevice &gpu, con
 #ifdef __ANDROID__
         bool support_android_buffer_import = false;
         bool support_unix_fd_import = false;
+        bool support_dma_buf = false;
 #endif
         for (const vk::ExtensionProperties &ext : gpu.enumerateDeviceExtensionProperties(nullptr, dispatch)) {
             const std::string_view name(ext.extensionName.data());
@@ -1628,6 +1669,8 @@ static int get_supported_mapping_methods_mask(const vk::PhysicalDevice &gpu, con
                 support_android_buffer_import = true;
             else if (name == VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)
                 support_unix_fd_import = true;
+            else if (name == VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME)
+                support_dma_buf = true;
 #endif
         }
 
@@ -1646,7 +1689,7 @@ static int get_supported_mapping_methods_mask(const vk::PhysicalDevice &gpu, con
 
 #ifdef __ANDROID__
         support_android_buffer_import &= SDL_GetAndroidSDKVersion() >= 26;
-        support_unix_fd_import &= SDL_GetAndroidSDKVersion() >= 26;
+        support_unix_fd_import &= SDL_GetAndroidSDKVersion() >= 26 && support_dma_buf;
 #endif
 
         if (support_memory_mapping) {
@@ -1801,8 +1844,18 @@ TrappedBuffer *BufferTrapping::access_buffer(Address addr, uint32_t size, MemSta
             return &temp_buffer;
         }
 
+        const vkutil::Buffer *backing_buffer = std::get_if<vkutil::Buffer>(&mem_it->second.buffer_impl);
+        if (!backing_buffer) {
+            // Buffer trapping is only implemented for the PageTable/DoubleBuffer mapping methods,
+            // which back mapped_memories with a vkutil::Buffer. ExternalHost/NativeBuffer mappings
+            // are backed by an ExternalBuffer with no CPU-side staging pointer here, so there is
+            // nothing safe to trap -- report it instead of crashing with std::bad_variant_access.
+            LOG_ERROR("Buffer trapping requested for an address mapped with a non-trappable method (addr {})", log_hex(addr));
+            return &temp_buffer;
+        }
+
         temp_buffer.size = size;
-        temp_buffer.mapped_location = reinterpret_cast<uint8_t *>(std::get<vkutil::Buffer>(mem_it->second.buffer_impl).mapped_data);
+        temp_buffer.mapped_location = reinterpret_cast<uint8_t *>(backing_buffer->mapped_data);
         temp_buffer.mapped_location += addr - mem_it->first;
         temp_buffer.extra = ~0;
 
@@ -1846,7 +1899,16 @@ TrappedBuffer *BufferTrapping::access_buffer(Address addr, uint32_t size, MemSta
             return &it->second;
         }
 
-        it->second.mapped_location = reinterpret_cast<uint8_t *>(std::get<vkutil::Buffer>(mem_it->second.buffer_impl).mapped_data);
+        const vkutil::Buffer *backing_buffer = std::get_if<vkutil::Buffer>(&mem_it->second.buffer_impl);
+        if (!backing_buffer) {
+            // see access_buffer's small-buffer path above: trapping isn't meaningful for
+            // ExternalHost/NativeBuffer mappings, so bail out instead of throwing bad_variant_access.
+            LOG_ERROR("Buffer trapping requested for an address mapped with a non-trappable method (addr {})", log_hex(addr));
+            trapped_buffers.erase(it);
+            return &temp_buffer;
+        }
+
+        it->second.mapped_location = reinterpret_cast<uint8_t *>(backing_buffer->mapped_data);
         it->second.mapped_location += addr - mem_it->first;
     }
 
@@ -1859,8 +1921,16 @@ TrappedBuffer *BufferTrapping::access_buffer(Address addr, uint32_t size, MemSta
         aligned_addr = align(addr, KiB(4));
         aligned_size = align_down(addr + size - aligned_addr, KiB(4));
     }
-    add_protect(mem, aligned_addr, aligned_size, MemPerm::ReadOnly, [it](Address addr, bool write) {
-        it->second.dirty = true;
+    add_protect(mem, aligned_addr, aligned_size, MemPerm::ReadOnly, [this, trap_addr = addr](Address fault_addr, bool write) {
+        // Look the entry up by key rather than holding the map iterator directly: this callback
+        // is stored in MemState's protect_tree independently of trapped_buffers, and a merged
+        // protect_tree segment can fire every callback registered on it for any fault inside the
+        // segment -- including ones whose trapped_buffers node was already erased (by the overlap
+        // cleanup above or by remove_range). Re-finding by address turns a dangling-iterator
+        // use-after-free into a harmless no-op when the entry no longer exists.
+        auto trap_it = trapped_buffers.find(trap_addr);
+        if (trap_it != trapped_buffers.end())
+            trap_it->second.dirty = true;
         return true;
     });
 
