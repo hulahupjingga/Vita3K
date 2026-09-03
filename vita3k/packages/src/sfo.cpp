@@ -97,6 +97,7 @@ bool get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int
     std::replace(app_info.app_title.begin(), app_info.app_title.end(), '\n', ' ');
     boost::trim(app_info.app_title);
     sfo::get_data_by_key(app_info.app_title_id, sfo_handle, "TITLE_ID");
+    return true;
 }
 
 bool load(SfoFile &sfile, const std::vector<uint8_t> &content) {
