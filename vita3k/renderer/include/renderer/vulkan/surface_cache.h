@@ -230,7 +230,7 @@ public:
 
     // Return the image along with the viewport to be displayed on the screen
     // Viewport should already have its fields width and height filled
-    vk::ImageView sourcing_color_surface_for_presentation(Ptr<const void> address, uint32_t pitch, Viewport &viewport);
+    vk::ImageView sourcing_color_surface_for_presentation(Ptr<const void> address, uint32_t pitch, Viewport &viewport, vk::CommandBuffer cmd_buffer);
 
     // Dump an rgba8 frame with the given properties to the returned vector
     // if this function fails, the vector will be empty
