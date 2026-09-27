@@ -1389,7 +1389,7 @@ void VKSurfaceCache::destroy_associated_framebuffers(const VKRenderTarget *rende
     destroy_framebuffers(render_target->depthstencil.view);
 }
 
-vk::ImageView VKSurfaceCache::sourcing_color_surface_for_presentation(Ptr<const void> address, uint32_t pitch, Viewport &viewport) {
+vk::ImageView VKSurfaceCache::sourcing_color_surface_for_presentation(Ptr<const void> address, uint32_t pitch, Viewport &viewport, vk::CommandBuffer cmd_buffer) {
     // get closest surface with an address below address
     auto ite = color_address_lookup.upper_bound(address.address());
     if (ite == color_address_lookup.begin()) {
@@ -1426,6 +1426,32 @@ vk::ImageView VKSurfaceCache::sourcing_color_surface_for_presentation(Ptr<const 
             viewport.height = limited_height;
             viewport.texture_width = info.width;
             viewport.texture_height = info.height;
+
+            // The render target normally sits in ColorAttachmentReadWrite (General layout,
+            // written via eColorAttachmentOutput -- see transition_to(..., ColorAttachmentReadWrite)
+            // elsewhere in this file). Every presentation consumer -- fragment-shader filters
+            // (Bilinear/Nearest/Bicubic/FXAA) sampling it in the swapchain render pass, and FSR's
+            // EASU compute dispatch sampling it *before* that render pass even begins -- reads it
+            // as a shader resource afterwards, but nothing here previously synchronized that read
+            // against the render pass write. Fragment-shader consumers happened to get away with
+            // it from incidental ordering (later in the command buffer, inside a render pass with
+            // its own barriers); FSR's compute read, issued earlier and with no render pass framing
+            // to fall back on, does not. Make the dependency explicit and include both stages a
+            // reader might use, the same way vkutil's SampledImage/StorageImage table already does.
+            vk::ImageMemoryBarrier presentation_read_barrier{
+                .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eColorAttachmentRead,
+                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+                .oldLayout = vk::ImageLayout::eGeneral,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = info.texture.image,
+                .subresourceRange = vkutil::color_subresource_range
+            };
+            cmd_buffer.pipelineBarrier(
+                vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eComputeShader,
+                vk::DependencyFlags(), {}, {}, presentation_read_barrier);
 
             if (info.swizzle == vkutil::rgba_mapping && info.texture.format == vk::Format::eR8G8B8A8Unorm)
                 return info.texture.view;

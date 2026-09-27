@@ -1156,7 +1156,7 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState 
 
         vk::ImageLayout layout = vk::ImageLayout::eGeneral;
         vk::ImageView surface_handle = surface_cache.sourcing_color_surface_for_presentation(
-            frame.base, frame.pitch, viewport);
+            frame.base, frame.pitch, viewport, screen_renderer.current_cmd_buffer);
 
         if (!surface_handle) {
             vkutil::Image &vita_surface = screen_renderer.vita_surface[screen_renderer.swapchain_image_idx];
