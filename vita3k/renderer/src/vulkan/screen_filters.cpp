@@ -662,6 +662,25 @@ void FSRScreenFilter::on_resize() {
         img.init_image(vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled);
     }
 
+    // RCAS writes here instead of the swapchain image directly. The swapchain's actual
+    // format can't be relied on to match what the shader declares (VK_FORMAT_B8G8R8A8_UNORM
+    // vs VK_FORMAT_R8G8B8A8_UNORM depend on what the platform/driver advertises -- Mali's
+    // Android driver in particular is known to expose BGRA8 swapchains over a physically
+    // RGBA8 buffer). Writing into an image we create ourselves, always R8G8B8A8Unorm to
+    // match the shader's rgba8 qualifier exactly, then copying into the swapchain
+    // afterwards, sidesteps having to know or force that format at all.
+    // Sized to the full swapchain extent (not output_size) so the shader's existing
+    // "pos + offset" addressing for letterbox/pillarbox placement keeps working unmodified.
+    if (rcas_output_images.size() != screen.swapchain_size)
+        rcas_output_images.resize(screen.swapchain_size);
+    for (auto &img : rcas_output_images) {
+        img.destroy();
+        img.width = screen.extent.width;
+        img.height = screen.extent.height;
+        img.format = vk::Format::eR8G8B8A8Unorm;
+        img.init_image(vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc);
+    }
+
     // update the descriptor sets (except the first sampler image as it is not fixed)
     std::vector<vk::DescriptorImageInfo> descr_images(screen.swapchain_size * 3);
     std::vector<vk::WriteDescriptorSet> write_descr(screen.swapchain_size * 3);
@@ -685,7 +704,7 @@ void FSRScreenFilter::on_resize() {
             .setDescriptorType(vk::DescriptorType::eSampledImage);
         // rcas dst
         descr_images[i * 3 + 2]
-            .setImageView(screen.swapchain_views[i])
+            .setImageView(rcas_output_images[i].view)
             .setImageLayout(vk::ImageLayout::eGeneral);
         write_descr[i * 3 + 2]
             .setDstSet(descriptor_sets[i * 2 + 1])
@@ -752,19 +771,12 @@ void FSRScreenFilter::render(bool is_pre_renderpass, vk::ImageView src_img, vk::
     // then transition the read texture to sampled // wait for the previous compute shader to be done
     intermediate_images[screen.swapchain_image_idx].transition_to(cmd_buffer, vkutil::ImageLayout::SampledImage);
 
-    // also transition the swapchain image to general
-    barrier = {
-        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-        .dstAccessMask = vk::AccessFlagBits::eShaderWrite,
-        .oldLayout = vk::ImageLayout::eTransferDstOptimal,
-        .newLayout = vk::ImageLayout::eGeneral,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = screen.swapchain_images[screen.swapchain_image_idx],
-        .subresourceRange = vkutil::color_subresource_range
-    };
-    cmd_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eComputeShader,
-        vk::DependencyFlags(), {}, {}, barrier);
+    // RCAS writes into its own dedicated R8G8B8A8Unorm image instead of the swapchain
+    // image directly -- see the comment in on_resize() for why. We don't care about its
+    // previous content (full-frame discard), and the shader writes the whole output_size
+    // region of it every frame via the same "pos + offset" addressing it already used
+    // when it wrote directly into the swapchain.
+    rcas_output_images[screen.swapchain_image_idx].transition_to_discard(cmd_buffer, vkutil::ImageLayout::StorageImage);
 
     // sharpening pass
     cmd_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline_rcas);
@@ -776,6 +788,57 @@ void FSRScreenFilter::render(bool is_pre_renderpass, vk::ImageView src_img, vk::
     };
     cmd_buffer.pushConstants(pipeline_layout_rcas, vk::ShaderStageFlagBits::eCompute, 0, sizeof(RcasConstant), &rcas_constant);
     cmd_buffer.dispatch(dispatch_x, dispatch_y, 1);
+
+    // wait for RCAS's writes, then hand the image to the copy below
+    rcas_output_images[screen.swapchain_image_idx].transition_to(cmd_buffer, vkutil::ImageLayout::TransferSrc);
+
+    // WAW hazard: the earlier clear and this copy are both transfer writes into
+    // overlapping regions of the swapchain image (the copy's target rect sits inside
+    // the area the clear covered), and nothing otherwise orders them against each other.
+    barrier = {
+        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+        .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+        .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = screen.swapchain_images[screen.swapchain_image_idx],
+        .subresourceRange = vkutil::color_subresource_range
+    };
+    cmd_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eTransfer,
+        vk::DependencyFlags(), {}, {}, barrier);
+
+    // copy (not blit) since both images are the same explicit format -- avoids depending
+    // on VK_FORMAT_FEATURE_BLIT_SRC/DST_BIT support, which is one more thing this saga
+    // has shown isn't safe to assume on every driver. Same rect on both sides: RCAS
+    // already wrote at exactly [output_offset, output_offset + output_size) in its
+    // full-extent-sized output image, matching where it belongs in the swapchain.
+    vk::ImageCopy copy_region{
+        .srcSubresource = vkutil::color_subresource_layer,
+        .srcOffset = { static_cast<int32_t>(output_offset.width), static_cast<int32_t>(output_offset.height), 0 },
+        .dstSubresource = vkutil::color_subresource_layer,
+        .dstOffset = { static_cast<int32_t>(output_offset.width), static_cast<int32_t>(output_offset.height), 0 },
+        .extent = { output_size.width, output_size.height, 1 }
+    };
+    cmd_buffer.copyImage(
+        rcas_output_images[screen.swapchain_image_idx].image, vk::ImageLayout::eTransferSrcOptimal,
+        screen.swapchain_images[screen.swapchain_image_idx], vk::ImageLayout::eTransferDstOptimal,
+        copy_region);
+
+    // transition the swapchain image to general, same as post_filter_render_pass
+    // (create_render_pass() in screen_renderer.cpp) already expects as its initialLayout
+    barrier = {
+        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+        .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite,
+        .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+        .newLayout = vk::ImageLayout::eGeneral,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = screen.swapchain_images[screen.swapchain_image_idx],
+        .subresourceRange = vkutil::color_subresource_range
+    };
+    cmd_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        vk::DependencyFlags(), {}, {}, barrier);
 
     // the barrier for the render pass will be handled by the renderpass external dependencies
 }
