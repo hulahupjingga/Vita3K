@@ -841,7 +841,7 @@ Java_org_vita3k_emulator_NativeLib_getCustomDriverSupportInfo(JNIEnv *env, jclas
 
 JNIEXPORT jboolean JNICALL
 Java_org_vita3k_emulator_NativeLib_shouldShowCustomDriverOptions(JNIEnv *, jclass) {
-    return default_gpu_is_mali(get_emuenv()) ? JNI_FALSE : JNI_TRUE;
+    return JNI_TRUE;
 }
 
 JNIEXPORT jobjectArray JNICALL
